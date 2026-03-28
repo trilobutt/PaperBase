@@ -14,7 +14,7 @@ It replaces the Zotero + ZotMoov + DocFetcher toolchain with a single fast appli
 
 ## Target Platform
 
-Windows 10/11 only. No cross-platform requirement. Python 3.11+.
+Windows 10/11 only. No cross-platform requirement. Python 3.12 exactly (run via `py -3.12`; no other version is supported).
 
 ---
 
@@ -660,7 +660,7 @@ class LLMCategoriser:
 
 ## Code Style
 
-- Python 3.11+. Type hints on all function signatures.
+- Python 3.12 exactly (`py -3.12`). Type hints on all function signatures.
 - `pathlib.Path` throughout. No `os.path` usage.
 - `dataclasses` for all data transfer objects.
 - No ORM. All SQL written as explicit parameterised query strings in `core/db.py`.
@@ -692,7 +692,7 @@ class LLMCategoriser:
 [project]
 name = "paperbase"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = "==3.12.*"
 dependencies = [
     "PyQt6>=6.6",
     "tantivy>=0.22",

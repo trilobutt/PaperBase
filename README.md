@@ -19,7 +19,7 @@ Built for researchers with libraries of 100k+ papers who need sub-second full-te
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.11 or later
+- Python 3.12 (exactly — use `py -3.12`; other versions are not supported)
 
 No other system dependencies. All libraries are pure Python or ship pre-built wheels.
 
@@ -28,9 +28,7 @@ No other system dependencies. All libraries are pure Python or ship pre-built wh
 ```
 git clone https://github.com/yourname/paperbase.git
 cd paperbase
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
+py -3.12 -m pip install -e .
 ```
 
 ## Running
