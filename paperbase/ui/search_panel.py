@@ -121,6 +121,10 @@ class SearchPanel(QWidget):
         self._needs_review_cb.stateChanged.connect(self._apply_filters)
         sbl.addWidget(self._needs_review_cb)
 
+        self._books_only_cb = QCheckBox("Books only")
+        self._books_only_cb.stateChanged.connect(self._apply_filters)
+        sbl.addWidget(self._books_only_cb)
+
         sbl.addWidget(QLabel("Tags:"))
         self._tag_list = QListWidget()
         self._tag_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
@@ -200,6 +204,7 @@ class SearchPanel(QWidget):
         year_to = self._year_to.value() or None
         journal = self._journal_filter.text().strip() or None
         needs_review = self._needs_review_cb.isChecked()
+        document_type = "book" if self._books_only_cb.isChecked() else None
 
         sidebar_tags = [item.text() for item in self._tag_list.selectedItems()]
         combined_tags = list(set(self._active_tags + sidebar_tags)) or None
@@ -212,6 +217,7 @@ class SearchPanel(QWidget):
             tags=combined_tags,
             collection_id=self._active_collection,
             needs_review_only=needs_review,
+            document_type=document_type,
         )
 
         papers = self._db.get_papers_by_ids(filtered_ids)

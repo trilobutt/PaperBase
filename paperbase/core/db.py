@@ -275,6 +275,7 @@ class Database:
         tags: Optional[list[str]] = None,
         collection_id: Optional[int] = None,
         needs_review_only: bool = False,
+        document_type: Optional[str] = None,
     ) -> list[int]:
         """Post-filter a list of paper_ids from Tantivy using SQLite predicates."""
         if not paper_ids:
@@ -295,6 +296,9 @@ class Database:
             params.append(f"%{journal}%")
         if needs_review_only:
             conditions.append("needs_review = 1")
+        if document_type is not None:
+            conditions.append("document_type = ?")
+            params.append(document_type)
 
         where = " AND ".join(conditions)
         rows = conn.execute(f"SELECT id FROM papers WHERE {where}", params).fetchall()
