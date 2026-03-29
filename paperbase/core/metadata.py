@@ -17,7 +17,23 @@ logger = logging.getLogger(__name__)
 DOI_RE = re.compile(r'\b(10\.\d{4,9}/[^\s"<>{|}\\^[\]`]+)')
 JATS_TAG_RE = re.compile(r"<[^>]+>")
 
+# Matches "ISBN", "ISBN-13", "ISBN-10", "ISBN:" etc. followed by the number.
+# Captures the raw digit/hyphen string; normalisation is done separately.
+ISBN_RE = re.compile(
+    r'(?:ISBN(?:-1[03])?[:\s]*)'
+    r'((?:97[89][- ]?)?(?:\d[- ]?){9}[\dX])',
+    re.IGNORECASE,
+)
+# Bare ISBN-13 (no prefix) — 978/979 followed by 10 digits
+ISBN13_BARE_RE = re.compile(r'\b(97[89]\d{10})\b')
+
 CROSSREF_BASE = "https://api.crossref.org/works"
+OPENLIBRARY_BASE = "https://openlibrary.org/api/books"
+GOOGLEBOOKS_BASE = "https://www.googleapis.com/books/v1/volumes"
+
+# Crossref type field values that map to book-like documents
+_BOOK_TYPES = {"book", "monograph", "reference-book", "edited-book", "book-set"}
+_CHAPTER_TYPES = {"book-chapter", "book-section", "book-part", "book-track"}
 
 
 def _now_iso() -> str:
@@ -80,6 +96,41 @@ def extract_doi_from_pdf(path: Path) -> Optional[str]:
     return None
 
 
+def _normalise_isbn(raw: str) -> str:
+    """Strip hyphens and spaces; return pure digit string (or with trailing X for ISBN-10)."""
+    return re.sub(r"[- ]", "", raw).upper()
+
+
+def extract_isbn_from_pdf(path: Path) -> Optional[str]:
+    """Extract first ISBN from PDF text, preferring ISBN-13. Returns normalised digit string."""
+    try:
+        doc = fitz.open(str(path))
+    except Exception as e:
+        logger.warning("Cannot open PDF %s: %s", path, e)
+        return None
+
+    try:
+        text_parts: list[str] = []
+        for page_num in range(min(3, len(doc))):
+            text_parts.append(doc[page_num].get_text())
+        full_text = "\n".join(text_parts)
+
+        # Prefixed ISBN (most reliable)
+        m = ISBN_RE.search(full_text)
+        if m:
+            return _normalise_isbn(m.group(1))
+
+        # Bare ISBN-13 (common on copyright pages)
+        m2 = ISBN13_BARE_RE.search(full_text)
+        if m2:
+            return _normalise_isbn(m2.group(1))
+
+    finally:
+        doc.close()
+
+    return None
+
+
 async def resolve_metadata(doi: str, user_email: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
     """Query Crossref for full metadata for a DOI."""
     url = f"{CROSSREF_BASE}/{doi}"
@@ -127,9 +178,9 @@ def _parse_crossref_response(data: dict, doi: str) -> Paper:
         elif given:
             authors.append(given)
 
-    # Journal
+    # Journal / publisher: prefer container-title; fall back to publisher field (common for books)
     containers = msg.get("container-title", [])
-    journal = containers[0] if containers else ""
+    journal = containers[0] if containers else (msg.get("publisher", "") or "")
 
     # Year
     year: Optional[int] = None
@@ -149,6 +200,30 @@ def _parse_crossref_response(data: dict, doi: str) -> Paper:
 
     # Keywords from subject
     keywords: list[str] = msg.get("subject", []) or []
+
+    # Document type from Crossref type field
+    cr_type = (msg.get("type", "") or "").lower()
+    if cr_type in _BOOK_TYPES:
+        document_type = "book"
+    elif cr_type in _CHAPTER_TYPES:
+        document_type = "book-chapter"
+    elif cr_type == "proceedings-article":
+        document_type = "proceedings"
+    else:
+        document_type = "article"
+
+    # ISBN (Crossref returns a list for books)
+    isbn: Optional[str] = None
+    raw_isbns: list[str] = msg.get("ISBN", []) or []
+    if raw_isbns:
+        # Prefer ISBN-13 (starts with 978/979)
+        for raw in raw_isbns:
+            normalised = _normalise_isbn(raw)
+            if normalised.startswith(("978", "979")):
+                isbn = normalised
+                break
+        if isbn is None:
+            isbn = _normalise_isbn(raw_isbns[0])
 
     now = _now_iso()
     return Paper(
@@ -171,6 +246,8 @@ def _parse_crossref_response(data: dict, doi: str) -> Paper:
         metadata_source="crossref",
         needs_review=False,
         open_access=False,
+        isbn=isbn,
+        document_type=document_type,
     )
 
 
@@ -182,6 +259,7 @@ async def guess_metadata_from_text(path: Path, user_email: str, rate_limiter: "R
         volume="", issue="", pages="", abstract="", keywords=[], tags=[],
         collection_ids=[], file_path=str(path), date_added=now, date_modified=now,
         metadata_source="filename", needs_review=True, open_access=False,
+        isbn=None, document_type="article",
     )
 
     # Extract first-page text
@@ -255,6 +333,159 @@ async def _crossref_bib_search(
             return paper
 
     return None
+
+
+async def resolve_book_metadata(isbn: str, user_email: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+    """
+    Resolve book metadata by ISBN.
+    Tries Open Library first; falls back to Google Books.
+    Returns None if neither source yields a result.
+    """
+    paper = await _openlibrary_lookup(isbn, rate_limiter)
+    if paper:
+        return paper
+    return await _googlebooks_lookup(isbn, rate_limiter)
+
+
+async def _openlibrary_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+    params = {"bibkeys": f"ISBN:{isbn}", "format": "json", "jscmd": "data"}
+    await rate_limiter.acquire_crossref()  # reuse the crossref slot for general rate limiting
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(OPENLIBRARY_BASE, params=params)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.warning("Open Library request failed for ISBN %s: %s", isbn, e)
+        return None
+
+    key = f"ISBN:{isbn}"
+    if key not in data:
+        return None
+    book = data[key]
+
+    title = book.get("title", "")
+    # subtitle
+    subtitle = book.get("subtitle", "")
+    if subtitle:
+        title = f"{title}: {subtitle}"
+
+    raw_authors = book.get("authors", [])
+    authors = [a.get("name", "") for a in raw_authors if a.get("name")]
+
+    publishers = book.get("publishers", [])
+    publisher = publishers[0].get("name", "") if publishers else ""
+
+    year: Optional[int] = None
+    pub_date = book.get("publish_date", "")
+    if pub_date:
+        m = re.search(r"\b(1[89]\d\d|20\d\d)\b", pub_date)
+        if m:
+            year = int(m.group(1))
+
+    # Description may be a string or {"value": "..."}
+    desc_raw = book.get("description", "")
+    if isinstance(desc_raw, dict):
+        desc_raw = desc_raw.get("value", "")
+    abstract = JATS_TAG_RE.sub("", desc_raw).strip()
+
+    subjects = book.get("subjects", [])
+    keywords = [s.get("name", s) if isinstance(s, dict) else str(s) for s in subjects]
+
+    # Page count → store in pages field
+    pages = str(book.get("number_of_pages", "") or "")
+
+    now = _now_iso()
+    return Paper(
+        id=None,
+        doi=None,
+        title=title,
+        authors=authors,
+        journal=publisher,
+        year=year,
+        volume="",
+        issue="",
+        pages=pages,
+        abstract=abstract,
+        keywords=keywords[:20],  # cap to avoid noise
+        tags=[],
+        collection_ids=[],
+        file_path="",
+        date_added=now,
+        date_modified=now,
+        metadata_source="openlibrary",
+        needs_review=False,
+        open_access=False,
+        isbn=isbn,
+        document_type="book",
+    )
+
+
+async def _googlebooks_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+    params = {"q": f"isbn:{isbn}"}
+    await rate_limiter.acquire_crossref()
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(GOOGLEBOOKS_BASE, params=params)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except httpx.HTTPError as e:
+        logger.warning("Google Books request failed for ISBN %s: %s", isbn, e)
+        return None
+
+    items = data.get("items", [])
+    if not items:
+        return None
+    info = items[0].get("volumeInfo", {})
+
+    title = info.get("title", "")
+    subtitle = info.get("subtitle", "")
+    if subtitle:
+        title = f"{title}: {subtitle}"
+
+    authors = info.get("authors", [])
+    publisher = info.get("publisher", "")
+
+    year: Optional[int] = None
+    pub_date = info.get("publishedDate", "")
+    if pub_date:
+        m = re.search(r"\b(1[89]\d\d|20\d\d)\b", pub_date)
+        if m:
+            year = int(m.group(1))
+
+    abstract = JATS_TAG_RE.sub("", info.get("description", "") or "").strip()
+
+    categories = info.get("categories", [])
+    keywords = [c for c in categories]
+
+    pages = str(info.get("pageCount", "") or "")
+
+    now = _now_iso()
+    return Paper(
+        id=None,
+        doi=None,
+        title=title,
+        authors=authors,
+        journal=publisher,
+        year=year,
+        volume="",
+        issue="",
+        pages=pages,
+        abstract=abstract,
+        keywords=keywords,
+        tags=[],
+        collection_ids=[],
+        file_path="",
+        date_added=now,
+        date_modified=now,
+        metadata_source="googlebooks",
+        needs_review=False,
+        open_access=False,
+        isbn=isbn,
+        document_type="book",
+    )
 
 
 def extract_fulltext(path: Path) -> str:

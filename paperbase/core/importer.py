@@ -26,7 +26,9 @@ from paperbase.core.metadata import (
     RateLimiter,
     extract_doi_from_pdf,
     extract_fulltext,
+    extract_isbn_from_pdf,
     guess_metadata_from_text,
+    resolve_book_metadata,
     resolve_metadata,
 )
 from paperbase.core.organiser import place_file
@@ -177,6 +179,13 @@ class ImportWorker(QThread):
         paper = None
         if doi:
             paper = await resolve_metadata(doi, self._user_email, rl)
+
+        # No DOI or Crossref returned nothing — try ISBN (book)
+        if paper is None:
+            isbn = extract_isbn_from_pdf(path)
+            if isbn:
+                paper = await resolve_book_metadata(isbn, self._user_email, rl)
+
         if paper is None:
             paper = await guess_metadata_from_text(path, self._user_email, rl)
 
@@ -245,6 +254,10 @@ class ImportWorker(QThread):
         paper = None
         if doi:
             paper = await resolve_metadata(doi, self._user_email, rl)
+        if paper is None:
+            isbn = extract_isbn_from_pdf(tmp)  # type: ignore[arg-type]
+            if isbn:
+                paper = await resolve_book_metadata(isbn, self._user_email, rl)
         if paper is None:
             paper = await guess_metadata_from_text(tmp, self._user_email, rl)  # type: ignore[arg-type]
         paper.open_access = False

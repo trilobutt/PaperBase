@@ -748,3 +748,28 @@ First place to look when debugging index corruption or a missing/empty DB.
 - Always initialise `paper = None` before a conditional `if doi: paper = await resolve_metadata(...)` block.
   Python raises `UnboundLocalError` on the `if paper is None:` fallback if `doi` was falsy and the branch never ran.
 - `ImportWorker` (QThread) creates its own `asyncio.new_event_loop()` and is not connected to the `qasync` main-thread loop.
+
+### Async from main-thread Qt slots
+- `asyncio.ensure_future(coro)` works directly from synchronous Qt slots (e.g. button `clicked`).
+  qasync installs its loop as the running loop on the main thread, so coroutines resume there and
+  can safely update UI. Do NOT use QThread for this — QThread is only for CPU-bound or blocking work.
+
+### SQLite schema migrations
+- Adding new columns to an existing DB: call `ALTER TABLE papers ADD COLUMN ...` wrapped in
+  `try/except sqlite3.OperationalError` inside a `_migrate()` method called from `Database.open()`.
+  SQLite has no `IF NOT EXISTS` clause for `ALTER TABLE`.
+
+### Extending the Paper dataclass
+- New fields must be keyword arguments with defaults (e.g. `isbn: Optional[str] = None`) so that
+  existing `Paper(...)` construction sites that omit them (scraper, metadata, tests) keep working.
+  Required positional fields cannot be added after optional ones in a dataclass.
+
+### Book metadata
+- `journal` field stores publisher name when `document_type == "book"`. UI label reads "Journal/Publisher".
+- Book lookup order: Open Library (`https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data`)
+  then Google Books (`https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}`). Both are free, no API key.
+- Import pipeline: DOI → (no result) → ISBN → `resolve_book_metadata` → `guess_metadata_from_text`.
+
+### Smoke-testing without a test suite
+- `py -3.12 -c "from paperbase.xxx import yyy; print('OK')"` is the fastest correctness check.
+  Run after any change that touches imports or dataclass fields.

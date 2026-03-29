@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._search_panel)
 
         # Right: detail panel
-        self._detail_panel = PaperDetail(self._db)
+        self._detail_panel = PaperDetail(self._db, user_email=self._settings.user_email)
         self._detail_panel.paper_changed.connect(self._on_paper_changed)
         self._detail_panel.setMinimumWidth(260)
         splitter.addWidget(self._detail_panel)
@@ -158,6 +158,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self._settings, self)
         if dlg.exec():
             self._settings.save(self._settings_path)
+            self._detail_panel.set_user_email(self._settings.user_email)
             self._refresh_status()
 
     def _refresh_status(self) -> None:

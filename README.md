@@ -7,7 +7,9 @@ Built for researchers with libraries of 100k+ papers who need sub-second full-te
 ## Features
 
 - **Full-text search** across all PDFs using Tantivy (Rust inverted index, BM25 ranking, Lucene-class performance)
-- **Automatic metadata resolution** — extracts DOIs from PDF text and fetches full bibliographic data from Crossref
+- **Automatic metadata resolution** — extracts DOIs from PDF text and fetches full bibliographic data from Crossref, including abstracts
+- **Book support** — extracts ISBNs from PDFs and landing pages; resolves metadata via Open Library and Google Books; `document_type` field distinguishes articles, books, book chapters, and proceedings
+- **Manual metadata lookup** — DOI and ISBN lookup buttons in the detail panel fetch and populate all fields on demand
 - **Open-access PDF download** via Unpaywall when given DOIs or publisher landing page URLs
 - **Publisher landing page scraping** — supports Highwire Press, Dublin Core, JSON-LD, and OpenGraph meta tags, covering Springer, Nature, Elsevier, Wiley, OUP, CUP, PLOS, PubMed Central, arXiv, bioRxiv, and more
 - **Automatic file organisation** into a configurable folder hierarchy (e.g. `{journal}/{year}/{author} ({year}) {title}.pdf`)
@@ -71,7 +73,7 @@ Open the **Import** dialog from the toolbar. Three input modes are available:
 Drag and drop PDF files onto the queue. PaperBase will:
 
 1. Extract the DOI from the first few pages of each PDF
-2. Resolve full metadata from Crossref (or fall back to XMP metadata / filename if no DOI is found)
+2. Resolve full metadata from Crossref, including abstract (or fall back to ISBN → book metadata → XMP metadata → filename if no DOI is found)
 3. Copy each file into the organised folder hierarchy
 4. Index the full text
 
@@ -105,6 +107,8 @@ Expected duration for 130k papers: 2–6 hours depending on network conditions a
 Papers where metadata could not be confirmed automatically are flagged with a **Needs Review** badge in the detail panel. Click through each to verify and correct. The badge is dismissed manually once you are satisfied.
 
 All metadata fields are directly editable in the right-hand panel. Every save is a single SQL `UPDATE` — no secondary queries, no latency.
+
+The **DOI** and **ISBN** fields each have a **Lookup** button. Enter or correct an identifier and click Lookup to fetch and overwrite all available fields from Crossref (DOI) or Open Library / Google Books (ISBN). Only non-empty fields in the fetched result are written; existing data is not blanked.
 
 ## Folder naming pattern
 

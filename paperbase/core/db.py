@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS papers (
     date_modified   TEXT NOT NULL,
     metadata_source TEXT NOT NULL DEFAULT 'unknown',
     needs_review    INTEGER NOT NULL DEFAULT 0,
-    open_access     INTEGER NOT NULL DEFAULT 0
+    open_access     INTEGER NOT NULL DEFAULT 0,
+    isbn            TEXT,
+    document_type   TEXT NOT NULL DEFAULT 'article'
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -49,6 +51,7 @@ def _now_iso() -> str:
 
 
 def _paper_from_row(row: sqlite3.Row) -> Paper:
+    keys = row.keys()
     return Paper(
         id=row["id"],
         doi=row["doi"],
@@ -69,6 +72,8 @@ def _paper_from_row(row: sqlite3.Row) -> Paper:
         metadata_source=row["metadata_source"],
         needs_review=bool(row["needs_review"]),
         open_access=bool(row["open_access"]),
+        isbn=row["isbn"] if "isbn" in keys else None,
+        document_type=row["document_type"] if "document_type" in keys else "article",
     )
 
 
@@ -88,7 +93,20 @@ class Database:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after initial release (ALTER TABLE is idempotent via try/except)."""
+        assert self._conn is not None
+        for stmt in (
+            "ALTER TABLE papers ADD COLUMN isbn TEXT",
+            "ALTER TABLE papers ADD COLUMN document_type TEXT NOT NULL DEFAULT 'article'",
+        ):
+            try:
+                self._conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     def close(self) -> None:
         if self._conn:
@@ -111,8 +129,9 @@ class Database:
             INSERT INTO papers
                 (doi, title, authors, journal, year, volume, issue, pages,
                  abstract, keywords, tags, collection_ids, file_path,
-                 date_added, date_modified, metadata_source, needs_review, open_access)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 date_added, date_modified, metadata_source, needs_review, open_access,
+                 isbn, document_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 paper.doi,
@@ -133,6 +152,8 @@ class Database:
                 paper.metadata_source,
                 int(paper.needs_review),
                 int(paper.open_access),
+                paper.isbn,
+                paper.document_type,
             ),
         )
         conn.commit()
@@ -146,7 +167,7 @@ class Database:
                 doi=?, title=?, authors=?, journal=?, year=?, volume=?, issue=?,
                 pages=?, abstract=?, keywords=?, tags=?, collection_ids=?,
                 file_path=?, date_modified=?, metadata_source=?,
-                needs_review=?, open_access=?
+                needs_review=?, open_access=?, isbn=?, document_type=?
             WHERE id=?
             """,
             (
@@ -167,6 +188,8 @@ class Database:
                 paper.metadata_source,
                 int(paper.needs_review),
                 int(paper.open_access),
+                paper.isbn,
+                paper.document_type,
                 paper.id,
             ),
         )
@@ -178,6 +201,7 @@ class Database:
             "doi", "title", "authors", "journal", "year", "volume", "issue",
             "pages", "abstract", "keywords", "tags", "collection_ids",
             "file_path", "metadata_source", "needs_review", "open_access",
+            "isbn", "document_type",
         }
         if field not in allowed:
             raise ValueError(f"Unknown field: {field}")

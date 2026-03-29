@@ -117,11 +117,14 @@ async def scrape_landing_page(url: str) -> ScrapeResult:
 
     if v := hw("citation_title"):
         meta.title = v
+    # citation_book_title is used by book chapters; prefer it over citation_journal_title
+    book_title = hw("citation_book_title")
     authors_hw = hw_all("citation_author")
     if authors_hw:
         meta.authors = authors_hw
-    if v := hw("citation_journal_title"):
-        meta.journal = v
+    journal_src = book_title or hw("citation_journal_title")
+    if journal_src:
+        meta.journal = journal_src
     if v := hw("citation_publication_date"):
         meta.year = _parse_year(v)
     if v := hw("citation_volume"):
@@ -142,6 +145,13 @@ async def scrape_landing_page(url: str) -> ScrapeResult:
         for kw in kw_tags:
             keywords.extend(k.strip() for k in kw.split(",") if k.strip())
         meta.keywords = keywords
+
+    # ISBN from Highwire (used on book and book-chapter pages)
+    isbn_raw = hw("citation_isbn")
+    if isbn_raw:
+        meta.isbn = re.sub(r"[- ]", "", isbn_raw).upper()
+        if book_title or not hw("citation_journal_title"):
+            meta.document_type = "book"
 
     # ---- PRIORITY 2: Dublin Core ----
     def dc(name: str) -> Optional[str]:
@@ -191,13 +201,27 @@ async def scrape_landing_page(url: str) -> ScrapeResult:
                 continue
 
         at = data.get("@type", "")
-        if at not in ("ScholarlyArticle", "Article", "CreativeWork"):
+        if at not in ("ScholarlyArticle", "Article", "CreativeWork", "Book"):
             continue
+
+        if at == "Book":
+            meta.document_type = "book"
 
         if not result.doi:
             ident = data.get("identifier", "")
             if isinstance(ident, str):
                 result.doi = _strip_doi(ident)
+            # ISBN in identifier array
+            idents = data.get("identifier", [])
+            if isinstance(idents, list):
+                for id_item in idents:
+                    if isinstance(id_item, dict):
+                        id_type = id_item.get("@type", "") or id_item.get("propertyID", "")
+                        if "ISBN" in id_type.upper():
+                            raw_isbn = re.sub(r"[- ]", "", id_item.get("value", "")).upper()
+                            if raw_isbn and not meta.isbn:
+                                meta.isbn = raw_isbn
+                                meta.document_type = "book"
 
         if not result.pdf_url:
             u = data.get("url", "")
