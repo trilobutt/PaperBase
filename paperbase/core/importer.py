@@ -189,7 +189,7 @@ class ImportWorker(QThread):
         if paper is None:
             paper = await guess_metadata_from_text(path, self._user_email, rl)
 
-        place_file(path, paper, self._library_root, move=False)
+        place_file(path, paper, self._library_root, move=True)
         fulltext = extract_fulltext(path)
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
