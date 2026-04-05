@@ -175,6 +175,7 @@ class ImportWorker(QThread):
 
         doi = extract_doi_from_pdf(path)
         if doi and self._db.paper_exists_by_doi(doi):
+            self.log_message.emit(f"Skipped (already in library, DOI {doi}): {path.name}")
             self.item_finished.emit(str(path), True, False)
             return True, False
 

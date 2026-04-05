@@ -225,6 +225,9 @@ def _parse_crossref_response(data: dict, doi: str) -> Paper:
         if isbn is None:
             isbn = _normalise_isbn(raw_isbns[0])
 
+    # Mark for review if Crossref record is missing key fields
+    needs_review = not title or not authors
+
     now = _now_iso()
     return Paper(
         id=None,
@@ -244,7 +247,7 @@ def _parse_crossref_response(data: dict, doi: str) -> Paper:
         date_added=now,
         date_modified=now,
         metadata_source="crossref",
-        needs_review=False,
+        needs_review=needs_review,
         open_access=False,
         isbn=isbn,
         document_type=document_type,

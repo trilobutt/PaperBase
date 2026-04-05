@@ -795,6 +795,11 @@ First place to look when debugging index corruption or a missing/empty DB.
 - `py -3.12 -c "from paperbase.xxx import yyy; print('OK')"` is the fastest correctness check.
   Run after any change that touches imports or dataclass fields.
 
+### Debugging import failures
+- Check the DB directly first: `py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"`
+- Crossref legitimately returns `title: []` and `author: []` for some valid DOIs (e.g. 10.3752/cjai.2010.09). These now set `needs_review=True` automatically. If a paper imports with blank title despite `metadata_source='crossref'`, the Crossref record itself is incomplete — verify with a direct GET to `https://api.crossref.org/works/{doi}`.
+- DOI-duplicate skip: if a file "won't import", it may already be in the library under a different path. The importer skips silently (now logs "Skipped (already in library, DOI ...)"). Check by querying the DB for the DOI rather than the file path.
+
 ### SQLite variable limit
 - `SQLITE_MAX_VARIABLE_NUMBER` is 999 on older SQLite builds. Any `IN (?,?...)` clause must be
   chunked at ≤900 items. `get_papers_by_ids` already does this. Do not add new unbounded IN
