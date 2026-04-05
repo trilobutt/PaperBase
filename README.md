@@ -6,15 +6,16 @@ Built for researchers with libraries of 100k+ papers who need sub-second full-te
 
 ## Features
 
-- **Full-text search** across all PDFs using Tantivy (Rust inverted index, BM25 ranking, Lucene-class performance)
+- **Full-text search** across all PDFs using Tantivy (Rust inverted index, BM25 ranking, Lucene-class performance); results include a 0–100 relevance score normalised against the top hit
 - **Automatic metadata resolution** — extracts DOIs from PDF text and fetches full bibliographic data from Crossref, including abstracts
 - **Book support** — extracts ISBNs from PDFs and landing pages; resolves metadata via Open Library and Google Books; `document_type` field distinguishes articles, books, book chapters, and proceedings
-- **Manual metadata lookup** — DOI and ISBN lookup buttons in the detail panel fetch and populate all fields on demand
+- **Manual metadata lookup** — DOI and ISBN lookup buttons in the detail panel fetch and populate all fields (including abstract) on demand
 - **Open-access PDF download** via Unpaywall when given DOIs or publisher landing page URLs
 - **Publisher landing page scraping** — supports Highwire Press, Dublin Core, JSON-LD, and OpenGraph meta tags, covering Springer, Nature, Elsevier, Wiley, OUP, CUP, PLOS, PubMed Central, arXiv, bioRxiv, and more
 - **Automatic file organisation** into a configurable folder hierarchy (e.g. `{journal}/{year}/{author} ({year}) {title}.pdf`)
-- **Hierarchical collections** and free-form tags
+- **Hierarchical collections** and free-form tags; drag papers from the results table directly onto a collection to assign membership
 - **Flat SQLite schema** — no normalised author/journal tables; every metadata edit is a single `UPDATE`, no joins, no latency
+- **Duplicate detection** — all import modes skip papers already in the library by DOI, with counts reported in the import summary
 - **Batch import** with resumable progress for first-run ingestion of existing large libraries
 - Non-modal import: the application is fully usable during background import
 
@@ -66,7 +67,7 @@ All persistent state is written to `%LOCALAPPDATA%\PaperBase\PaperBase\`:
 
 ## Importing papers
 
-Open the **Import** dialog from the toolbar. Three input modes are available:
+Open the **Import** dialog from the toolbar. Three input modes are available.
 
 ### Drop PDFs
 
@@ -74,8 +75,10 @@ Drag and drop PDF files onto the queue. PaperBase will:
 
 1. Extract the DOI from the first few pages of each PDF
 2. Resolve full metadata from Crossref, including abstract (or fall back to ISBN → book metadata → XMP metadata → filename if no DOI is found)
-3. Copy each file into the organised folder hierarchy
+3. Move each file into the organised folder hierarchy
 4. Index the full text
+
+Files already present in the library (matched by DOI) are skipped and counted as duplicates in the summary.
 
 ### Paste DOIs
 
@@ -96,11 +99,29 @@ The import dialog is non-modal. Close it and the import continues in the status 
 Pointing PaperBase at a folder containing tens of thousands of PDFs triggers the bulk import pipeline:
 
 - Progress is saved every 100 papers to `import_state.json`; if the application is closed mid-import, it resumes where it left off on next launch
-- The UI shows total / processed / succeeded / needs review / failed counts with a running ETA
+- The UI shows total / processed / succeeded / needs review / duplicates skipped / failed counts with a running ETA
 - Import can be paused and resumed at any time
 - The application is fully usable for papers already processed while import continues
 
 Expected duration for 130k papers: 2–6 hours depending on network conditions and Crossref response times.
+
+## Search
+
+Enter any query in the search bar and press Enter. Tantivy's query syntax is supported:
+
+| Syntax | Example |
+|---|---|
+| Phrase | `"neural scaling laws"` |
+| Field-scoped | `title:attention authors:vaswani` |
+| Boolean | `transformer AND vision NOT language` |
+| Year range | `year:[2020 TO 2023]` |
+| Prefix | `embed*` |
+
+Results show a **score** column (0–100) normalised against the top hit. Re-sort by any column via the header. Filter the results further by year range, journal, document type (articles / books), tags, or collection using the controls in the left panel.
+
+## Collections
+
+The left panel shows a hierarchical collection tree. To assign papers to a collection, drag one or more rows from the results table and drop them onto the target collection node. Right-click a collection node to create sub-collections, rename, or delete (deleting a collection does not delete its papers).
 
 ## Metadata review
 
@@ -108,7 +129,7 @@ Papers where metadata could not be confirmed automatically are flagged with a **
 
 All metadata fields are directly editable in the right-hand panel. Every save is a single SQL `UPDATE` — no secondary queries, no latency.
 
-The **DOI** and **ISBN** fields each have a **Lookup** button. Enter or correct an identifier and click Lookup to fetch and overwrite all available fields from Crossref (DOI) or Open Library / Google Books (ISBN). Only non-empty fields in the fetched result are written; existing data is not blanked.
+The **DOI** and **ISBN** fields each have a **Lookup** button. Enter or correct an identifier and click Lookup to fetch and overwrite all available fields — including abstract — from Crossref (DOI) or Open Library / Google Books (ISBN). Only non-empty fields in the fetched result are written; existing data is not blanked.
 
 ## Folder naming pattern
 
