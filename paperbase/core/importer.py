@@ -196,7 +196,7 @@ class ImportWorker(QThread):
         if paper is None:
             paper = await guess_metadata_from_text(path, self._user_email, rl)
 
-        place_file(path, paper, self._library_root, move=True, folder_pattern=self._folder_pattern)
+        place_file(path, paper, self._library_root, move=False, folder_pattern=self._folder_pattern)
         fulltext = extract_fulltext(path)
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
@@ -220,7 +220,7 @@ class ImportWorker(QThread):
         result = await download_via_unpaywall(doi, self._user_email, self._tmp_dir, rl)
         if not result.success:
             self.item_failed.emit(doi, result.reason)
-            return False, False
+            return False, False, False
 
         paper = await resolve_metadata(doi, self._user_email, rl)
         if paper is None:
