@@ -14,17 +14,19 @@ from paperbase.core.indexer import Indexer
 from paperbase.models.paper import Paper
 from paperbase.models.search_result import SearchResult
 
-_COLUMNS = ["Title", "Authors", "Journal", "Year"]
+_COLUMNS = ["Title", "Authors", "Journal", "Year", "Score"]
 
 
 class PaperTableModel(QAbstractTableModel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._papers: list[Paper] = []
+        self._scores: dict[int, float] = {}  # paper_id -> normalised 0-100 score
 
-    def set_papers(self, papers: list[Paper]) -> None:
+    def set_papers(self, papers: list[Paper], scores: Optional[dict[int, float]] = None) -> None:
         self.beginResetModel()
         self._papers = papers
+        self._scores = scores or {}
         self.endResetModel()
 
     def paper_at(self, row: int) -> Optional[Paper]:
@@ -58,6 +60,9 @@ class PaperTableModel(QAbstractTableModel):
             return p.journal or ""
         if col == 3:
             return str(p.year) if p.year else ""
+        if col == 4:
+            s = self._scores.get(p.id or -1)
+            return f"{s:.0f}" if s is not None else ""
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
@@ -84,6 +89,10 @@ class PaperTableModel(QAbstractTableModel):
             self._papers.sort(key=lambda p: p.journal.lower(), reverse=reverse)
         elif column == 3:
             self._papers.sort(key=lambda p: p.year or 0, reverse=reverse)
+        elif column == 4:
+            self._papers.sort(
+                key=lambda p: self._scores.get(p.id or -1, 0.0), reverse=reverse
+            )
         self.endResetModel()
 
 
@@ -170,6 +179,7 @@ class SearchPanel(QWidget):
         self._table.setColumnWidth(1, 160)
         self._table.setColumnWidth(2, 160)
         self._table.setColumnWidth(3, 50)
+        self._table.setColumnWidth(4, 55)
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
         self._table.setDragEnabled(True)
@@ -185,6 +195,7 @@ class SearchPanel(QWidget):
 
         self._last_query = ""
         self._last_result_ids: Optional[list[int]] = None  # None = all papers
+        self._last_scores: dict[int, float] = {}  # paper_id -> normalised 0-100
 
     # ------------------------------------------------------------------
 
@@ -193,9 +204,20 @@ class SearchPanel(QWidget):
         if query.strip():
             results = self._indexer.search(query)
             self._last_result_ids = [r.paper_id for r in results]
+            # Normalise BM25 scores to 0-100 relative to the top hit
+            if results:
+                max_score = max(r.score for r in results)
+                self._last_scores = (
+                    {r.paper_id: (r.score / max_score) * 100 for r in results}
+                    if max_score > 0
+                    else {r.paper_id: 0.0 for r in results}
+                )
+            else:
+                self._last_scores = {}
         else:
             # None signals search_filter to query all papers without an IN clause.
             self._last_result_ids = None
+            self._last_scores = {}
         self._apply_filters()
 
     def set_collection_filter(self, collection_id: Optional[int]) -> None:
@@ -240,7 +262,8 @@ class SearchPanel(QWidget):
         )
 
         papers = self._db.get_papers_by_ids(filtered_ids)
-        self._model.set_papers(papers)
+        scores = self._last_scores if self._last_scores else None
+        self._model.set_papers(papers, scores)
         count = len(papers)
         self._result_count_label.setText(f"{count} paper{'s' if count != 1 else ''}")
 

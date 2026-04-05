@@ -595,8 +595,8 @@ times. Requirements:
   - Tags: `QListWidget` (multi-select checkboxes)
   - Collection: selecting a collection node in the left panel filters results to that collection
   - "Needs Review only" checkbox
-- Results sorted by Tantivy BM25 score by default; user can re-sort by year/title/journal via
-  column headers.
+- Results sorted by Tantivy BM25 score by default; user can re-sort by year/title/journal/score via
+  column headers. Score column shows 0–100 normalised against the top hit; blank when no query is active.
 
 ### Import Dialog
 
@@ -747,6 +747,10 @@ All persistent state is stored under `%LOCALAPPDATA%\PaperBase\PaperBase\`:
 
 First place to look when debugging index corruption or a missing/empty DB.
 `import_state.json` (first-run import resume state) lives at `{library_root}/import_state.json` (alongside the PDFs, not in the app data dir).
+
+### PaperTableModel column extension
+- Adding a column requires touching three places in `ui/search_panel.py`: `_COLUMNS` (drives `columnCount` and `headerData` automatically), `data()` (new `if col == N` branch), and `sort()` (new `elif column == N` branch).
+- Scores are not stored on `Paper`; `PaperTableModel` holds a separate `_scores: dict[int, float]` (paper_id → value) passed into `set_papers()`. Absent entries render as `""`.
 
 ### PyQt6 gotchas
 - `QFlowLayout` does not exist in PyQt6. Tag chips in `ui/paper_detail.py` use `QHBoxLayout` with `AlignLeft`.
