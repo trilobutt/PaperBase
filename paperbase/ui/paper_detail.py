@@ -321,6 +321,7 @@ class PaperDetail(QWidget):
 
     async def _do_doi_lookup(self, doi: str) -> None:
         from paperbase.core.metadata import RateLimiter, resolve_metadata
+        from paperbase.core.scraper import scrape_landing_page
         self._set_lookup_busy(True)
         try:
             rl = RateLimiter()
@@ -328,6 +329,15 @@ class PaperDetail(QWidget):
             if paper is None:
                 logger.warning("DOI lookup returned no result for %s", doi)
                 return
+            # Crossref often omits abstracts even when the publisher page has one.
+            # Fall back to scraping the DOI landing page for the abstract.
+            if not paper.abstract:
+                try:
+                    scrape = await scrape_landing_page(f"https://doi.org/{doi}")
+                    if scrape.metadata and scrape.metadata.abstract:
+                        paper.abstract = scrape.metadata.abstract
+                except Exception as scrape_err:
+                    logger.debug("Abstract scrape fallback failed for %s: %s", doi, scrape_err)
             self._apply_lookup_result(paper)
         except Exception as e:
             logger.error("DOI lookup failed: %s", e)
