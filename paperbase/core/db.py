@@ -221,11 +221,16 @@ class Database:
         if not ids:
             return []
         conn = self._conn_required()
-        placeholders = ",".join("?" * len(ids))
-        rows = conn.execute(
-            f"SELECT * FROM papers WHERE id IN ({placeholders})", ids
-        ).fetchall()
-        by_id = {r["id"]: _paper_from_row(r) for r in rows}
+        by_id: dict[int, Paper] = {}
+        # SQLite SQLITE_MAX_VARIABLE_NUMBER is 999 on many builds; chunk to be safe.
+        chunk_size = 900
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT * FROM papers WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+            by_id.update({r["id"]: _paper_from_row(r) for r in rows})
         # preserve order
         return [by_id[i] for i in ids if i in by_id]
 
@@ -268,7 +273,7 @@ class Database:
 
     def search_filter(
         self,
-        paper_ids: list[int],
+        paper_ids: Optional[list[int]],
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         journal: Optional[str] = None,
@@ -277,13 +282,23 @@ class Database:
         needs_review_only: bool = False,
         document_type: Optional[str] = None,
     ) -> list[int]:
-        """Post-filter a list of paper_ids from Tantivy using SQLite predicates."""
-        if not paper_ids:
+        """Post-filter paper_ids using SQLite predicates.
+
+        paper_ids=None means no Tantivy pre-filter (search all papers).
+        An empty list returns immediately with no results.
+        """
+        if paper_ids is not None and not paper_ids:
             return []
         conn = self._conn_required()
-        placeholders = ",".join("?" * len(paper_ids))
-        conditions = [f"id IN ({placeholders})"]
-        params: list[object] = list(paper_ids)
+        conditions: list[str] = []
+        params: list[object] = []
+
+        # When paper_ids is provided (Tantivy results, max ~500), add IN clause.
+        # When None (show-all case), skip it — no variable-count explosion.
+        if paper_ids is not None:
+            placeholders = ",".join("?" * len(paper_ids))
+            conditions.append(f"id IN ({placeholders})")
+            params.extend(paper_ids)
 
         if year_from is not None:
             conditions.append("year >= ?")
@@ -300,12 +315,20 @@ class Database:
             conditions.append("document_type = ?")
             params.append(document_type)
 
-        where = " AND ".join(conditions)
-        rows = conn.execute(f"SELECT id FROM papers WHERE {where}", params).fetchall()
-        matched = {r["id"] for r in rows}
+        where = " AND ".join(conditions) if conditions else "1=1"
+        order = "" if paper_ids is not None else " ORDER BY date_added DESC"
+        rows = conn.execute(
+            f"SELECT id FROM papers WHERE {where}{order}", params
+        ).fetchall()
+
+        if paper_ids is not None:
+            # Preserve Tantivy BM25 rank order
+            matched = {r["id"] for r in rows}
+            result = [i for i in paper_ids if i in matched]
+        else:
+            result = [r["id"] for r in rows]
 
         # Tag filter: must hold in Python since tags is a JSON array
-        result = [i for i in paper_ids if i in matched]
         if tags:
             filtered = []
             for pid in result:
@@ -371,6 +394,20 @@ class Database:
             )
         conn.execute("DELETE FROM collections WHERE id=?", (collection_id,))
         conn.commit()
+
+    def add_paper_to_collection(self, paper_id: int, collection_id: int) -> None:
+        conn = self._conn_required()
+        row = conn.execute("SELECT collection_ids FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if row is None:
+            return
+        ids: list[int] = json.loads(row["collection_ids"])
+        if collection_id not in ids:
+            ids.append(collection_id)
+            conn.execute(
+                "UPDATE papers SET collection_ids=?, date_modified=? WHERE id=?",
+                (json.dumps(ids), _now_iso(), paper_id),
+            )
+            conn.commit()
 
     def get_collections(self) -> list[Collection]:
         conn = self._conn_required()

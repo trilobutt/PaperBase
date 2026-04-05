@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
         self._collection_tree.setMinimumWidth(160)
         self._collection_tree.collection_selected.connect(self._on_collection_selected)
         self._collection_tree.tag_selected.connect(self._on_tag_selected)
+        self._collection_tree.papers_added_to_collection.connect(self._on_papers_added_to_collection)
         splitter.addWidget(self._collection_tree)
 
         # Centre: search + results
@@ -124,6 +125,11 @@ class MainWindow(QMainWindow):
         self._search_panel.reload_current_paper(paper_id)
         self._collection_tree.refresh()
         self._refresh_status()
+
+    def _on_papers_added_to_collection(self, paper_ids: list[int]) -> None:
+        for pid in paper_ids:
+            self._search_panel.reload_current_paper(pid)
+        self._collection_tree.refresh()
 
     def _on_paper_deleted(self, paper_id: int) -> None:
         self._detail_panel.clear()

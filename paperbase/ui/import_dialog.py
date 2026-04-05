@@ -179,6 +179,7 @@ class ImportDialog(QDialog):
             library_root=self._library_root,
             user_email=self._user_email,
             state_file=self._state_file,
+            folder_pattern=self._settings.folder_pattern,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(self._on_log)

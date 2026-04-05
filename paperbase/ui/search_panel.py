@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, pyqtSignal
+from PyQt6.QtCore import Qt, QAbstractTableModel, QByteArray, QMimeData, QModelIndex, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QSpinBox,
@@ -59,6 +59,21 @@ class PaperTableModel(QAbstractTableModel):
         if col == 3:
             return str(p.year) if p.year else ""
         return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        base = super().flags(index)
+        return base | Qt.ItemFlag.ItemIsDragEnabled
+
+    def mimeTypes(self) -> list[str]:
+        return ["application/x-paperbase-paper-ids"]
+
+    def mimeData(self, indexes: list[QModelIndex]) -> QMimeData:
+        rows = {idx.row() for idx in indexes}
+        ids = [str(self._papers[r].id) for r in rows
+               if 0 <= r < len(self._papers) and self._papers[r].id is not None]
+        mime = QMimeData()
+        mime.setData("application/x-paperbase-paper-ids", QByteArray(",".join(ids).encode()))
+        return mime
 
     def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
         self.beginResetModel()
@@ -148,12 +163,17 @@ class SearchPanel(QWidget):
         self._table.setSortingEnabled(True)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self._table.horizontalHeader().setStretchLastSection(False)
+        # Sensible default widths; user can drag to resize any column.
+        self._table.setColumnWidth(0, 400)
+        self._table.setColumnWidth(1, 160)
+        self._table.setColumnWidth(2, 160)
+        self._table.setColumnWidth(3, 50)
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
+        self._table.setDragEnabled(True)
+        self._table.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self._table.selectionModel().currentRowChanged.connect(self._on_row_changed)
         self._table.doubleClicked.connect(self._on_double_click)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -164,19 +184,18 @@ class SearchPanel(QWidget):
         layout.addLayout(hbox)
 
         self._last_query = ""
-        self._last_result_ids: list[int] = []
+        self._last_result_ids: Optional[list[int]] = None  # None = all papers
 
     # ------------------------------------------------------------------
 
     def run_search(self, query: str) -> None:
         self._last_query = query
         if query.strip():
-            results = self._indexer.search(query, limit=500)
+            results = self._indexer.search(query)
             self._last_result_ids = [r.paper_id for r in results]
         else:
-            # No query: show all (up to 2000 most recent)
-            papers = self._db.get_all_papers_paginated(0, 2000)
-            self._last_result_ids = [p.id for p in papers if p.id is not None]  # type: ignore[misc]
+            # None signals search_filter to query all papers without an IN clause.
+            self._last_result_ids = None
         self._apply_filters()
 
     def set_collection_filter(self, collection_id: Optional[int]) -> None:
@@ -292,8 +311,11 @@ class SearchPanel(QWidget):
         self._model._papers = [p for p in self._model._papers if p.id != paper_id]
         self._model.endResetModel()
 
-        # Also drop from the cached result id list so re-filtering stays consistent
-        self._last_result_ids = [i for i in self._last_result_ids if i != paper_id]
+        # Drop from the cached result id list so re-filtering stays consistent.
+        # If _last_result_ids is None (show-all), re-filtering will naturally exclude
+        # the deleted paper via the DB query, so no update needed.
+        if self._last_result_ids is not None:
+            self._last_result_ids = [i for i in self._last_result_ids if i != paper_id]
 
         self.paper_selected.emit(None)
         self.paper_deleted.emit(paper_id)

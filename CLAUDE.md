@@ -189,9 +189,16 @@ from search results. All other display metadata comes from SQLite by paper_id.
    Runs in a `QThread` worker with progress signal emitted per document.
 2. **Incremental update**: After any import that adds documents, `indexer.add_document()` is called
    immediately. The Tantivy writer commits after each batch.
-3. **Search**: `indexer.search(query: str, limit: int) -> list[SearchResult]`. Uses Tantivy's
-   default BM25 query parser across all text fields. Returns paper_ids which are then fetched
-   from SQLite for full metadata.
+3. **Search**: `indexer.search(query: str) -> list[SearchResult]`. Uses Tantivy's default BM25
+   query parser across all text fields. Returns paper_ids which are then fetched from SQLite for
+   full metadata. Results are uncapped — `searcher.num_docs` is passed as the limit to Tantivy.
+
+### Query syntax
+
+Tantivy's parser supports: `"exact phrase"`, `field:term` (fields: title, abstract, authors,
+keywords, fulltext), `AND`/`OR`/`NOT`, `+required -excluded`,
+`year:[2020 TO 2023]` (range on indexed integer fields), `word*` (prefix).
+Invalid syntax triggers a fallback that wraps the whole input in quotes (phrase search).
 
 ---
 
@@ -743,6 +750,9 @@ First place to look when debugging index corruption or a missing/empty DB.
 
 ### PyQt6 gotchas
 - `QFlowLayout` does not exist in PyQt6. Tag chips in `ui/paper_detail.py` use `QHBoxLayout` with `AlignLeft`.
+- Drag from `QTableView`: must implement `flags()` (add `ItemIsDragEnabled`), `mimeTypes()`, and `mimeData()` on the model — `setDragEnabled(True)` alone does nothing.
+- Drop onto `QTreeView`: subclass the view and override `dragEnterEvent`/`dragMoveEvent`/`dropEvent`. Use `event.position().toPoint()` (not `event.pos()`) to get the drop point in PyQt6.
+- Custom drag-drop MIME type used across the app: `application/x-paperbase-paper-ids` — comma-separated paper IDs encoded as UTF-8 bytes.
 
 ### Async pattern in importer
 - Always initialise `paper = None` before a conditional `if doi: paper = await resolve_metadata(...)` block.
@@ -770,6 +780,27 @@ First place to look when debugging index corruption or a missing/empty DB.
   then Google Books (`https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}`). Both are free, no API key.
 - Import pipeline: DOI → (no result) → ISBN → `resolve_book_metadata` → `guess_metadata_from_text`.
 
+### Folder naming pattern data flow
+- `Settings.folder_pattern` (settings_dialog.py) → passed to `ImportDialog.__init__` → passed to
+  `ImportWorker(folder_pattern=...)` → passed to every `place_file(..., folder_pattern=...)` call
+  → forwarded to `compute_destination(paper, library_root, pattern)` in organiser.py.
+- `DEFAULT_PATTERN` is exported from `organiser.py` as the canonical fallback.
+- Papers with `metadata_source in ("xmp", "filename")` bypass the pattern entirely and land in `Unsorted/`.
+
 ### Smoke-testing without a test suite
 - `py -3.12 -c "from paperbase.xxx import yyy; print('OK')"` is the fastest correctness check.
   Run after any change that touches imports or dataclass fields.
+
+### SQLite variable limit
+- `SQLITE_MAX_VARIABLE_NUMBER` is 999 on older SQLite builds. Any `IN (?,?...)` clause must be
+  chunked at ≤900 items. `get_papers_by_ids` already does this. Do not add new unbounded IN
+  clauses against the full papers table.
+- `search_filter` accepts `paper_ids=None` as a sentinel meaning "no Tantivy pre-filter; query
+  all papers". This avoids building a 134k-item IN clause for the no-query browse case.
+  `paper_ids=[]` (empty list) is a distinct case meaning "no results".
+
+### Tag/collection filter performance
+- The tag and collection filter branches in `search_filter` call `get_paper(pid)` individually
+  per matching ID. This is acceptable for Tantivy results (≤500 IDs) but will be slow if
+  activated with `paper_ids=None` and a large result set. Known limitation; do not "fix" by
+  loading all IDs into an IN clause.

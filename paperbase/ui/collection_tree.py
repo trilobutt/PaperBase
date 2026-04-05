@@ -3,19 +3,69 @@ from typing import Optional
 from PyQt6.QtCore import QModelIndex, Qt, pyqtSignal
 from PyQt6.QtGui import QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
-    QInputDialog, QMenu, QMessageBox, QTreeView, QVBoxLayout, QWidget,
+    QAbstractItemView, QInputDialog, QMenu, QMessageBox, QTreeView, QVBoxLayout, QWidget,
 )
 
 from paperbase.core.db import Database
 from paperbase.models.collection import Collection
 
 COLLECTION_ID_ROLE = Qt.ItemDataRole.UserRole + 1
-TAG_ROLE = Qt.ItemDataRole.UserRole + 2
+TAG_ROLE           = Qt.ItemDataRole.UserRole + 2
+
+_PAPER_IDS_MIME = "application/x-paperbase-paper-ids"
+
+
+class _CollectionTreeView(QTreeView):
+    """QTreeView subclass that accepts paper-ID drops onto collection items."""
+
+    papers_dropped = pyqtSignal(list, int)  # (paper_ids: list[int], collection_id: int)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDropIndicatorShown(True)
+
+    def _collection_id_at(self, pos) -> Optional[int]:
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return None
+        item = self.model().itemFromIndex(index)
+        if item is None:
+            return None
+        col_id = item.data(COLLECTION_ID_ROLE)
+        # col_id is None for root headers and tag items
+        return col_id if isinstance(col_id, int) else None
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(_PAPER_IDS_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasFormat(_PAPER_IDS_MIME) and \
+                self._collection_id_at(event.position().toPoint()) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        col_id = self._collection_id_at(event.position().toPoint())
+        if col_id is None:
+            event.ignore()
+            return
+        raw = bytes(event.mimeData().data(_PAPER_IDS_MIME)).decode()
+        paper_ids = [int(x) for x in raw.split(",") if x.strip()]
+        if paper_ids:
+            self.papers_dropped.emit(paper_ids, col_id)
+        event.acceptProposedAction()
 
 
 class CollectionTree(QWidget):
-    collection_selected = pyqtSignal(object)   # Optional[int] — collection_id or None
-    tag_selected        = pyqtSignal(object)   # Optional[str] — tag name or None
+    collection_selected       = pyqtSignal(object)  # Optional[int] — collection_id or None
+    tag_selected              = pyqtSignal(object)  # Optional[str] — tag name or None
+    papers_added_to_collection = pyqtSignal(list)   # list[int] of affected paper_ids
 
     def __init__(self, db: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -29,12 +79,13 @@ class CollectionTree(QWidget):
         self._model = QStandardItemModel()
         self._model.setHorizontalHeaderLabels(["Collections & Tags"])
 
-        self._tree = QTreeView()
+        self._tree = _CollectionTreeView()
         self._tree.setModel(self._model)
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._context_menu)
         self._tree.selectionModel().currentChanged.connect(self._on_selection_changed)
         self._tree.setHeaderHidden(True)
+        self._tree.papers_dropped.connect(self._on_papers_dropped)
 
         layout.addWidget(self._tree)
         self.refresh()
@@ -53,7 +104,6 @@ class CollectionTree(QWidget):
 
         collections = self._db.get_collections()
         col_map: dict[Optional[int], QStandardItem] = {None: col_root}
-        # Build parent-first ordering
         remaining = list(collections)
         max_passes = len(remaining) + 1
         passes = 0
@@ -100,9 +150,13 @@ class CollectionTree(QWidget):
         elif col_id is not None:
             self.collection_selected.emit(col_id)
         else:
-            # root items — clear filter
             self.collection_selected.emit(None)
             self.tag_selected.emit(None)
+
+    def _on_papers_dropped(self, paper_ids: list[int], collection_id: int) -> None:
+        for pid in paper_ids:
+            self._db.add_paper_to_collection(pid, collection_id)
+        self.papers_added_to_collection.emit(paper_ids)
 
     def _context_menu(self, pos) -> None:
         index = self._tree.indexAt(pos)
@@ -116,7 +170,6 @@ class CollectionTree(QWidget):
         menu = QMenu(self)
 
         if col_id is not None:
-            # Existing collection
             menu.addAction("New Sub-collection", lambda: self._new_collection(parent_id=col_id))
             menu.addAction("Rename", lambda: self._rename_collection(col_id, item))
             menu.addAction("Delete", lambda: self._delete_collection(col_id))

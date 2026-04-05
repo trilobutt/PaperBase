@@ -91,7 +91,7 @@ class Indexer:
                 progress_cb(i + 1, total)
         self.commit()
 
-    def search(self, query_str: str, limit: int = 50) -> list[SearchResult]:
+    def search(self, query_str: str) -> list[SearchResult]:
         self._ensure_open()
         assert self._index is not None
         if not query_str.strip():
@@ -111,7 +111,8 @@ class Indexer:
             except Exception:
                 return []
 
-        hits = searcher.search(query, limit).hits
+        # num_docs gives all matching documents — no artificial cap
+        hits = searcher.search(query, searcher.num_docs).hits
 
         results: list[SearchResult] = []
         for score, doc_addr in hits:

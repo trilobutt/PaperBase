@@ -32,17 +32,30 @@ def _journal_safe(journal: str) -> str:
     return _fs_safe(journal)
 
 
-def compute_destination(paper: Paper, library_root: Path) -> Path:
-    """Compute the organised destination path for a paper."""
+DEFAULT_PATTERN = "{journal}/{year}/{author} ({year}) {title}.pdf"
+
+
+def compute_destination(paper: Paper, library_root: Path, pattern: str = DEFAULT_PATTERN) -> Path:
+    """Compute the organised destination path for a paper using the given naming pattern.
+
+    Tokens: {journal} {year} {author} {title}
+    Each token value is already filesystem-safe before substitution.
+    """
     journal = _journal_safe(paper.journal)
     year = str(paper.year) if paper.year else "Unknown"
     author = _fs_safe(_authors_short(paper.authors))
     title = _fs_safe(paper.title, max_len=80)
-    filename = f"{author} ({year}) {title}.pdf"
-    return library_root / journal / year / filename
+    relative = pattern.format(journal=journal, year=year, author=author, title=title)
+    return library_root / relative
 
 
-def place_file(source: Path, paper: Paper, library_root: Path, move: bool = False) -> Path:
+def place_file(
+    source: Path,
+    paper: Paper,
+    library_root: Path,
+    move: bool = False,
+    folder_pattern: str = DEFAULT_PATTERN,
+) -> Path:
     """
     Copy or move source PDF to the organised hierarchy.
     Returns the final destination Path.
@@ -50,12 +63,12 @@ def place_file(source: Path, paper: Paper, library_root: Path, move: bool = Fals
 
     If metadata_source is "xmp" or "filename" (i.e. all real lookups failed),
     the file is placed in Unsorted/ with its original name instead of applying
-    the user-configured naming pattern.
+    the naming pattern.
     """
     if paper.metadata_source in ("xmp", "filename"):
         dest = library_root / "Unsorted" / source.name
     else:
-        dest = compute_destination(paper, library_root)
+        dest = compute_destination(paper, library_root, folder_pattern)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     # Handle collisions
