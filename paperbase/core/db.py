@@ -290,42 +290,51 @@ class Database:
         if paper_ids is not None and not paper_ids:
             return []
         conn = self._conn_required()
-        conditions: list[str] = []
-        params: list[object] = []
 
-        # When paper_ids is provided (Tantivy results, max ~500), add IN clause.
-        # When None (show-all case), skip it — no variable-count explosion.
-        if paper_ids is not None:
-            placeholders = ",".join("?" * len(paper_ids))
-            conditions.append(f"id IN ({placeholders})")
-            params.extend(paper_ids)
+        # Build scalar filters (year, journal, etc.) separately from the ID set
+        # so they can be reused across chunks without reconstruction.
+        scalar_conditions: list[str] = []
+        scalar_params: list[object] = []
 
         if year_from is not None:
-            conditions.append("year >= ?")
-            params.append(year_from)
+            scalar_conditions.append("year >= ?")
+            scalar_params.append(year_from)
         if year_to is not None:
-            conditions.append("year <= ?")
-            params.append(year_to)
+            scalar_conditions.append("year <= ?")
+            scalar_params.append(year_to)
         if journal:
-            conditions.append("journal LIKE ?")
-            params.append(f"%{journal}%")
+            scalar_conditions.append("journal LIKE ?")
+            scalar_params.append(f"%{journal}%")
         if needs_review_only:
-            conditions.append("needs_review = 1")
+            scalar_conditions.append("needs_review = 1")
         if document_type is not None:
-            conditions.append("document_type = ?")
-            params.append(document_type)
+            scalar_conditions.append("document_type = ?")
+            scalar_params.append(document_type)
 
-        where = " AND ".join(conditions) if conditions else "1=1"
-        order = "" if paper_ids is not None else " ORDER BY date_added DESC"
-        rows = conn.execute(
-            f"SELECT id FROM papers WHERE {where}{order}", params
-        ).fetchall()
+        scalar_where = (" AND " + " AND ".join(scalar_conditions)) if scalar_conditions else ""
 
         if paper_ids is not None:
+            # Chunk the IN clause at 900 to stay under SQLite's 999-variable limit.
+            # Results from all chunks are unioned into a set, then re-ordered by
+            # Tantivy BM25 rank.
+            chunk_size = 900
+            matched: set[int] = set()
+            for i in range(0, len(paper_ids), chunk_size):
+                chunk = paper_ids[i : i + chunk_size]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT id FROM papers WHERE id IN ({placeholders}){scalar_where}",
+                    list(chunk) + list(scalar_params),
+                ).fetchall()
+                matched.update(r["id"] for r in rows)
             # Preserve Tantivy BM25 rank order
-            matched = {r["id"] for r in rows}
             result = [i for i in paper_ids if i in matched]
         else:
+            where = scalar_where.lstrip(" AND ") or "1=1"
+            rows = conn.execute(
+                f"SELECT id FROM papers WHERE {where} ORDER BY date_added DESC",
+                scalar_params,
+            ).fetchall()
             result = [r["id"] for r in rows]
 
         # Tag filter: must hold in Python since tags is a JSON array
