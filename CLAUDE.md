@@ -505,6 +505,7 @@ For each url:
       Download directly via httpx, verify Content-Type on GET.
       Save to tmp path.
       extract_doi_from_pdf(tmp_path) → doi
+      If doi already in DB: unlink tmp file, skip (duplicate).
       If doi: resolve_metadata(doi) → paper
       Else: guess_metadata_from_text(tmp_path) → paper
       paper.open_access = False (we don't know, assume not)
@@ -513,12 +514,15 @@ For each url:
   2b. If "landing_page":
       Call scraper.scrape_landing_page(url) → ScrapeResult
       (see scraper module below for full pipeline)
+      If ScrapeResult.doi already in DB: skip immediately (duplicate, no download needed).
 
       If ScrapeResult.pdf_url is not None:
         Attempt download of ScrapeResult.pdf_url (GET, verify Content-Type).
         If download succeeds:
-          Save to tmp, resolve_metadata(ScrapeResult.doi) if doi present,
-          else use ScrapeResult.metadata as paper fields.
+          Save to tmp; doi = ScrapeResult.doi or extract_doi_from_pdf(tmp).
+          If doi already in DB: unlink tmp file, skip (duplicate — covers case where
+          scrape.doi was None but PDF body contained a DOI).
+          resolve_metadata(doi) if doi present, else use ScrapeResult.metadata as paper fields.
           paper.open_access = ScrapeResult.is_open_access
           place_file, insert, index.
         If download fails (redirect to login, non-PDF response, 401/403):
@@ -798,7 +802,7 @@ First place to look when debugging index corruption or a missing/empty DB.
 ### Debugging import failures
 - Check the DB directly first: `py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"`
 - Crossref legitimately returns `title: []` and `author: []` for some valid DOIs (e.g. 10.3752/cjai.2010.09). These now set `needs_review=True` automatically. If a paper imports with blank title despite `metadata_source='crossref'`, the Crossref record itself is incomplete — verify with a direct GET to `https://api.crossref.org/works/{doi}`.
-- DOI-duplicate skip: if a file "won't import", it may already be in the library under a different path. The importer skips silently (now logs "Skipped (already in library, DOI ...)"). Check by querying the DB for the DOI rather than the file path.
+- DOI-duplicate skip: applies to all three import modes. URL modes download before the DOI is known; if a duplicate is detected post-download, the tmp file is unlinked before returning. If a file "won't import", check by querying the DB for the DOI rather than the file path.
 
 ### SQLite variable limit
 - `SQLITE_MAX_VARIABLE_NUMBER` is 999 on older SQLite builds. Any `IN (?,?...)` clause must be

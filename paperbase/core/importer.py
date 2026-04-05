@@ -48,7 +48,7 @@ class ImportWorker(QThread):
     item_started   = pyqtSignal(str)
     item_finished  = pyqtSignal(str, bool, bool)   # label, success, needs_review
     item_failed    = pyqtSignal(str, str)           # label, reason
-    progress       = pyqtSignal(int, int, int, int, int)  # done,total,ok,review,fail
+    progress       = pyqtSignal(int, int, int, int, int, int)  # done,total,ok,review,fail,dupes
     log_message    = pyqtSignal(str)
     finished_all   = pyqtSignal()
 
@@ -107,6 +107,7 @@ class ImportWorker(QThread):
         succeeded = 0
         review_count = 0
         failed = 0
+        dupes = 0
         start_time = time.monotonic()
 
         for idx, item in enumerate(self._items):
@@ -124,21 +125,24 @@ class ImportWorker(QThread):
 
             try:
                 if self._mode == "pdfs":
-                    ok, nr = await self._import_pdf(Path(item), rate_limiter)
+                    ok, nr, is_dupe = await self._import_pdf(Path(item), rate_limiter)
                 elif self._mode == "dois":
-                    ok, nr = await self._import_doi(item, rate_limiter)
+                    ok, nr, is_dupe = await self._import_doi(item, rate_limiter)
                 else:  # urls
-                    ok, nr = await self._import_url(item, rate_limiter)
+                    ok, nr, is_dupe = await self._import_url(item, rate_limiter)
             except Exception as e:
                 logger.exception("Unexpected error importing %s", item)
                 self.item_failed.emit(item, str(e))
                 failed += 1
-                ok, nr = False, False
+                ok, nr, is_dupe = False, False, False
 
             if ok:
-                succeeded += 1
-                if nr:
-                    review_count += 1
+                if is_dupe:
+                    dupes += 1
+                else:
+                    succeeded += 1
+                    if nr:
+                        review_count += 1
             else:
                 failed += 1
 
@@ -153,7 +157,7 @@ class ImportWorker(QThread):
                 m, s = divmod(int(remaining), 60)
                 eta_str = f" | ETA {m}m {s}s" if remaining > 0 else ""
 
-            self.progress.emit(done, total, succeeded, review_count, failed)
+            self.progress.emit(done, total, succeeded, review_count, failed, dupes)
             self.log_message.emit(
                 f"[{done}/{total}] {Path(item).name if self._mode == 'pdfs' else item}"
                 f"{eta_str}"
@@ -168,16 +172,16 @@ class ImportWorker(QThread):
     # Mode 1: local PDFs
     # ------------------------------------------------------------------
 
-    async def _import_pdf(self, path: Path, rl: RateLimiter) -> tuple[bool, bool]:
+    async def _import_pdf(self, path: Path, rl: RateLimiter) -> tuple[bool, bool, bool]:
         if self._db.paper_exists_by_path(str(path)):
             self.item_finished.emit(str(path), True, False)
-            return True, False
+            return True, False, True
 
         doi = extract_doi_from_pdf(path)
         if doi and self._db.paper_exists_by_doi(doi):
             self.log_message.emit(f"Skipped (already in library, DOI {doi}): {path.name}")
             self.item_finished.emit(str(path), True, False)
-            return True, False
+            return True, False, True
 
         paper = None
         if doi:
@@ -200,17 +204,17 @@ class ImportWorker(QThread):
         self._indexer.commit()
 
         self.item_finished.emit(str(path), True, paper.needs_review)
-        return True, paper.needs_review
+        return True, paper.needs_review, False
 
     # ------------------------------------------------------------------
     # Mode 2: DOI strings
     # ------------------------------------------------------------------
 
-    async def _import_doi(self, doi: str, rl: RateLimiter) -> tuple[bool, bool]:
+    async def _import_doi(self, doi: str, rl: RateLimiter) -> tuple[bool, bool, bool]:
         doi = doi.strip()
         if self._db.paper_exists_by_doi(doi):
             self.item_finished.emit(doi, True, False)
-            return True, False
+            return True, False, True
 
         from paperbase.core.downloader import download_via_unpaywall
         result = await download_via_unpaywall(doi, self._user_email, self._tmp_dir, rl)
@@ -231,13 +235,13 @@ class ImportWorker(QThread):
         self._indexer.commit()
 
         self.item_finished.emit(doi, True, paper.needs_review)
-        return True, paper.needs_review
+        return True, paper.needs_review, False
 
     # ------------------------------------------------------------------
     # Mode 3: URLs
     # ------------------------------------------------------------------
 
-    async def _import_url(self, url: str, rl: RateLimiter) -> tuple[bool, bool]:
+    async def _import_url(self, url: str, rl: RateLimiter) -> tuple[bool, bool, bool]:
         url_type = await classify_url(url)
 
         if url_type == "pdf":
@@ -245,14 +249,20 @@ class ImportWorker(QThread):
         else:
             return await self._import_landing_page(url, rl)
 
-    async def _import_direct_pdf_url(self, url: str, rl: RateLimiter) -> tuple[bool, bool]:
+    async def _import_direct_pdf_url(self, url: str, rl: RateLimiter) -> tuple[bool, bool, bool]:
         result = await download_pdf_direct(url, None, self._tmp_dir)
         if not result.success:
             self.item_failed.emit(url, result.reason)
-            return False, False
+            return False, False, False
 
         tmp = result.tmp_path
         doi = extract_doi_from_pdf(tmp)  # type: ignore[arg-type]
+
+        if doi and self._db.paper_exists_by_doi(doi):
+            tmp.unlink(missing_ok=True)  # type: ignore[union-attr]
+            self.log_message.emit(f"Skipped (already in library, DOI {doi}): {url}")
+            self.item_finished.emit(url, True, False)
+            return True, False, True
 
         paper = None
         if doi:
@@ -273,19 +283,24 @@ class ImportWorker(QThread):
         self._indexer.commit()
 
         self.item_finished.emit(url, True, paper.needs_review)
-        return True, paper.needs_review
+        return True, paper.needs_review, False
 
-    async def _import_landing_page(self, url: str, rl: RateLimiter) -> tuple[bool, bool]:
+    async def _import_landing_page(self, url: str, rl: RateLimiter) -> tuple[bool, bool, bool]:
         try:
             scrape: ScrapeResult = await scrape_landing_page(url)
         except ValueError as e:
             if str(e) == "direct_pdf":
                 return await self._import_direct_pdf_url(url, rl)
             self.item_failed.emit(url, str(e))
-            return False, False
+            return False, False, False
         except Exception as e:
             self.item_failed.emit(url, str(e))
-            return False, False
+            return False, False, False
+
+        if scrape.doi and self._db.paper_exists_by_doi(scrape.doi):
+            self.log_message.emit(f"Skipped (already in library, DOI {scrape.doi}): {url}")
+            self.item_finished.emit(url, True, False)
+            return True, False, True
 
         # Try direct PDF from scrape result
         if scrape.pdf_url:
@@ -293,6 +308,11 @@ class ImportWorker(QThread):
             if dl.success:
                 tmp = dl.tmp_path
                 doi = scrape.doi or extract_doi_from_pdf(tmp)  # type: ignore[arg-type]
+                if doi and self._db.paper_exists_by_doi(doi):
+                    tmp.unlink(missing_ok=True)  # type: ignore[union-attr]
+                    self.log_message.emit(f"Skipped (already in library, DOI {doi}): {url}")
+                    self.item_finished.emit(url, True, False)
+                    return True, False, True
                 if doi:
                     paper = await resolve_metadata(doi, self._user_email, rl)
                 else:
@@ -307,7 +327,7 @@ class ImportWorker(QThread):
                 self._indexer.add_document(paper, fulltext)
                 self._indexer.commit()
                 self.item_finished.emit(url, True, paper.needs_review)
-                return True, paper.needs_review
+                return True, paper.needs_review, False
             # Fall through to Unpaywall
 
         # Try Unpaywall
@@ -325,13 +345,13 @@ class ImportWorker(QThread):
                 self._indexer.add_document(paper, fulltext)
                 self._indexer.commit()
                 self.item_finished.emit(url, True, paper.needs_review)
-                return True, paper.needs_review
+                return True, paper.needs_review, False
 
             self.item_failed.emit(url, "no_oa_pdf")
-            return False, False
+            return False, False, False
 
         self.item_failed.emit(url, "no_doi_no_pdf")
-        return False, False
+        return False, False, False
 
     # ------------------------------------------------------------------
     # State persistence (for resumable 130k import)

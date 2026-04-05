@@ -102,8 +102,9 @@ class ImportDialog(QDialog):
         self._lbl_ok      = QLabel("OK: 0")
         self._lbl_review  = QLabel("Needs review: 0")
         self._lbl_failed  = QLabel("Failed: 0")
+        self._lbl_dupes   = QLabel("Duplicates: 0")
         for lbl in (self._lbl_queued, self._lbl_done, self._lbl_ok,
-                    self._lbl_review, self._lbl_failed):
+                    self._lbl_review, self._lbl_failed, self._lbl_dupes):
             counts_row.addWidget(lbl)
         counts_row.addStretch()
         pg_layout.addLayout(counts_row)
@@ -193,13 +194,14 @@ class ImportDialog(QDialog):
         self._stop_btn.setEnabled(True)
         self._worker.start()
 
-    @pyqtSlot(int, int, int, int, int)
-    def _on_progress(self, done: int, total: int, ok: int, review: int, failed: int) -> None:
+    @pyqtSlot(int, int, int, int, int, int)
+    def _on_progress(self, done: int, total: int, ok: int, review: int, failed: int, dupes: int) -> None:
         self._progress_bar.setValue(done)
         self._lbl_done.setText(f"Done: {done}")
         self._lbl_ok.setText(f"OK: {ok}")
         self._lbl_review.setText(f"Needs review: {review}")
         self._lbl_failed.setText(f"Failed: {failed}")
+        self._lbl_dupes.setText(f"Duplicates: {dupes}")
 
     @pyqtSlot(str)
     def _on_log(self, text: str) -> None:
