@@ -1,7 +1,7 @@
 from typing import Optional
 
-from PyQt6.QtCore import QModelIndex, Qt, pyqtSignal
-from PyQt6.QtGui import QStandardItem, QStandardItemModel
+from PyQt6.QtCore import QModelIndex, QPoint, Qt, pyqtSignal
+from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import (
     QAbstractItemView, QInputDialog, QMenu, QMessageBox, QTreeView, QVBoxLayout, QWidget,
 )
@@ -26,7 +26,7 @@ class _CollectionTreeView(QTreeView):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.setDropIndicatorShown(True)
 
-    def _collection_id_at(self, pos) -> Optional[int]:
+    def _collection_id_at(self, pos: QPoint) -> Optional[int]:
         index = self.indexAt(pos)
         if not index.isValid():
             return None
@@ -37,20 +37,20 @@ class _CollectionTreeView(QTreeView):
         # col_id is None for root headers and tag items
         return col_id if isinstance(col_id, int) else None
 
-    def dragEnterEvent(self, event) -> None:
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasFormat(_PAPER_IDS_MIME):
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dragMoveEvent(self, event) -> None:
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         if event.mimeData().hasFormat(_PAPER_IDS_MIME) and \
                 self._collection_id_at(event.position().toPoint()) is not None:
             event.acceptProposedAction()
         else:
             event.ignore()
 
-    def dropEvent(self, event) -> None:
+    def dropEvent(self, event: QDropEvent) -> None:
         col_id = self._collection_id_at(event.position().toPoint())
         if col_id is None:
             event.ignore()
@@ -158,7 +158,7 @@ class CollectionTree(QWidget):
             self._db.add_paper_to_collection(pid, collection_id)
         self.papers_added_to_collection.emit(paper_ids)
 
-    def _context_menu(self, pos) -> None:
+    def _context_menu(self, pos: QPoint) -> None:
         index = self._tree.indexAt(pos)
         item = self._model.itemFromIndex(index)
         if item is None:

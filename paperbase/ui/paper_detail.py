@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QMimeData, Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QFocusEvent
 from PyQt6.QtWidgets import (
     QApplication, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
@@ -193,7 +194,7 @@ class PaperDetail(QWidget):
 
         self._set_enabled(False)
 
-    def _abstract_focus_out(self, event) -> None:
+    def _abstract_focus_out(self, event: QFocusEvent) -> None:
         self._save_field("abstract", self._abstract_edit.toPlainText())
         QPlainTextEdit.focusOutEvent(self._abstract_edit, event)
 
@@ -322,9 +323,8 @@ class PaperDetail(QWidget):
             return
         try:
             import fitz
-            doc = fitz.open(self._paper.file_path)
-            text = "\n".join(page.get_text() for page in doc)
-            doc.close()
+            with fitz.open(self._paper.file_path) as doc:
+                text = "\n".join(page.get_text() for page in doc)
             QApplication.clipboard().setText(text)
         except Exception as e:
             logger.error("Failed to extract full text from %s: %s", self._paper.file_path, e)

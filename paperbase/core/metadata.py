@@ -56,7 +56,7 @@ def extract_doi_from_pdf(path: Path) -> Optional[str]:
         logger.warning("Cannot open PDF %s: %s", path, e)
         return None
 
-    try:
+    with doc:
         # Check first 3 pages
         text_parts: list[str] = []
         for page_num in range(min(3, len(doc))):
@@ -90,9 +90,6 @@ def extract_doi_from_pdf(path: Path) -> Optional[str]:
                 if _validate_doi(doi):
                     return doi
 
-    finally:
-        doc.close()
-
     return None
 
 
@@ -109,7 +106,7 @@ def extract_isbn_from_pdf(path: Path) -> Optional[str]:
         logger.warning("Cannot open PDF %s: %s", path, e)
         return None
 
-    try:
+    with doc:
         text_parts: list[str] = []
         for page_num in range(min(3, len(doc))):
             text_parts.append(doc[page_num].get_text())
@@ -124,9 +121,6 @@ def extract_isbn_from_pdf(path: Path) -> Optional[str]:
         m2 = ISBN13_BARE_RE.search(full_text)
         if m2:
             return _normalise_isbn(m2.group(1))
-
-    finally:
-        doc.close()
 
     return None
 
@@ -267,10 +261,9 @@ async def guess_metadata_from_text(path: Path, user_email: str, rate_limiter: "R
 
     # Extract first-page text
     try:
-        doc = fitz.open(str(path))
-        first_page_text = doc[0].get_text() if len(doc) > 0 else ""
-        xmp_meta = doc.metadata
-        doc.close()
+        with fitz.open(str(path)) as doc:
+            first_page_text = doc[0].get_text() if len(doc) > 0 else ""
+            xmp_meta = doc.metadata
     except Exception:
         base_paper.title = path.name
         return base_paper
@@ -494,9 +487,8 @@ async def _googlebooks_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optiona
 def extract_fulltext(path: Path) -> str:
     """Extract full text from a PDF for Tantivy indexing."""
     try:
-        doc = fitz.open(str(path))
-        parts = [page.get_text() for page in doc]
-        doc.close()
+        with fitz.open(str(path)) as doc:
+            parts = [page.get_text() for page in doc]
         return "\n".join(parts)
     except Exception as e:
         logger.warning("Full-text extraction failed for %s: %s", path, e)

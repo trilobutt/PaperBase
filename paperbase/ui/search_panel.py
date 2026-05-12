@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QObject, QPoint, QUrl, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QSpinBox,
@@ -19,7 +19,7 @@ _COLUMNS = ["Title", "Authors", "Journal", "Year", "Score"]
 
 
 class PaperTableModel(QAbstractTableModel):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._papers: list[Paper] = []
         self._scores: dict[int, float] = {}  # paper_id -> normalised 0-100 score
@@ -35,18 +35,18 @@ class PaperTableModel(QAbstractTableModel):
             return self._papers[row]
         return None
 
-    def rowCount(self, parent=QModelIndex()) -> int:
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(self._papers)
 
-    def columnCount(self, parent=QModelIndex()) -> int:
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return len(_COLUMNS)
 
-    def headerData(self, section: int, orientation, role=Qt.ItemDataRole.DisplayRole):
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> object:
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
             return _COLUMNS[section]
         return None
 
-    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return None
         p = self._papers[index.row()]
@@ -81,7 +81,7 @@ class PaperTableModel(QAbstractTableModel):
         mime.setData("application/x-paperbase-paper-ids", QByteArray(",".join(ids).encode()))
         return mime
 
-    def sort(self, column: int, order=Qt.SortOrder.AscendingOrder) -> None:
+    def sort(self, column: int, order: Qt.SortOrder = Qt.SortOrder.AscendingOrder) -> None:
         self.beginResetModel()
         reverse = order == Qt.SortOrder.DescendingOrder
         if column == 0:
@@ -296,7 +296,7 @@ class SearchPanel(QWidget):
                     self._model.dataChanged.emit(top, bot)
                 break
 
-    def _on_context_menu(self, pos) -> None:
+    def _on_context_menu(self, pos: QPoint) -> None:
         index = self._table.indexAt(pos)
         if not index.isValid():
             return
@@ -335,9 +335,8 @@ class SearchPanel(QWidget):
     def _copy_full_text(self, file_path: str) -> None:
         try:
             import fitz
-            doc = fitz.open(file_path)
-            text = "\n".join(page.get_text() for page in doc)
-            doc.close()
+            with fitz.open(file_path) as doc:
+                text = "\n".join(page.get_text() for page in doc)
             QApplication.clipboard().setText(text)
         except Exception as e:
             logger.error("Failed to extract full text from %s: %s", file_path, e)

@@ -348,6 +348,7 @@ that file.
 - Drag from `QTableView`: must implement `flags()` (+`ItemIsDragEnabled`), `mimeTypes()`, `mimeData()` on the model. `setDragEnabled(True)` alone does nothing.
 - Drop onto `QTreeView`: subclass + override `dragEnterEvent`/`dragMoveEvent`/`dropEvent`. Use `event.position().toPoint()` (not `event.pos()`).
 - MIME type for drag-drop: `application/x-paperbase-paper-ids` (comma-separated IDs, UTF-8).
+- Drag/focus event types (`QDragEnterEvent`, `QDragMoveEvent`, `QDropEvent`, `QFocusEvent`) are in `PyQt6.QtGui`; `QPoint`, `QObject` are in `PyQt6.QtCore` — not `QtWidgets`.
 
 ---
 
@@ -366,6 +367,8 @@ that file.
 **SQLite variable limit:** Chunk `IN (?,?...)` at ≤900 items (`SQLITE_MAX_VARIABLE_NUMBER` = 999 on older builds). `get_papers_by_ids` already does this; do not add new unbounded IN clauses. `search_filter` takes `paper_ids=None` (no pre-filter, query all) vs `paper_ids=[]` (no results — distinct case).
 
 **Tag/collection filter:** Calls `get_paper(pid)` individually per ID — acceptable for ≤500 Tantivy results, slow for `paper_ids=None` on large result sets. Known limitation; do not "fix" with an unbounded IN clause.
+
+**fitz context manager:** `fitz.Document` supports `with fitz.open(str(path)) as doc:` (PyMuPDF >= 1.18; project requires >= 1.24). Prefer this over manual `.close()` — bare `.close()` inside a `try` without `finally` leaks on exception.
 
 **Windows file actions:**
 - Reveal in Explorer: `subprocess.Popen(["explorer", "/select," + file_path])`
