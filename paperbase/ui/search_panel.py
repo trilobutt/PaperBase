@@ -119,8 +119,14 @@ class SearchPanel(QWidget):
         # ---- Filter sidebar ----
         sidebar = QWidget()
         sidebar.setFixedWidth(170)
+        sidebar.setStyleSheet(
+            "QWidget { background-color: #1c1917; border-right: 1px solid #141210; }"
+            " QLabel { background: transparent; color: #706860; font-size: 8pt;"
+            " font-weight: bold; margin-top: 4px; }"
+        )
         sbl = QVBoxLayout(sidebar)
-        sbl.setContentsMargins(4, 4, 4, 4)
+        sbl.setContentsMargins(6, 6, 6, 6)
+        sbl.setSpacing(3)
 
         sbl.addWidget(QLabel("Year from:"))
         self._year_from = QSpinBox()

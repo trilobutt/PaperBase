@@ -26,8 +26,9 @@ class TagChip(QPushButton):
         self._tag = tag
         self.setFlat(True)
         self.setStyleSheet(
-            "QPushButton { background: #e0e0e0; border-radius: 10px; padding: 2px 6px;"
-            " font-size: 12px; } QPushButton:hover { background: #c0c0c0; }"
+            "QPushButton { background: #3a3530; color: #e0d8cc; border-radius: 10px;"
+            " border: 1px solid #4a4540; padding: 2px 8px; font-size: 12px; }"
+            " QPushButton:hover { background: #F26822; color: #ffffff; border-color: #c44f10; }"
         )
         self.clicked.connect(lambda: self.removed.emit(self._tag))
 
@@ -52,16 +53,17 @@ class PaperDetail(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         inner = QWidget()
         self._form_layout = QVBoxLayout(inner)
         scroll.setWidget(inner)
         outer.addWidget(scroll)
 
         # Needs-review badge
-        self._review_badge = QLabel("⚠ Needs Review")
+        self._review_badge = QLabel("⚠  Needs Review")
         self._review_badge.setStyleSheet(
-            "background: #ffcc00; color: #333; font-weight: bold; padding: 4px 8px;"
-            " border-radius: 4px;"
+            "background: #F26822; color: #ffffff; font-weight: bold; padding: 4px 8px;"
+            " border-radius: 2px; border: 1px solid #c44f10;"
         )
         self._review_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._review_badge.hide()

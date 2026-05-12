@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         import_btn = QPushButton("Import")
+        import_btn.setObjectName("primary")
         import_btn.clicked.connect(self._open_import)
         toolbar.addWidget(import_btn)
 

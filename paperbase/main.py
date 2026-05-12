@@ -18,6 +18,7 @@ from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
 from paperbase.ui.main_window import MainWindow
 from paperbase.ui.settings_dialog import Settings
+from paperbase.ui.theme import apply_theme
 
 
 def _data_dir() -> Path:
@@ -67,7 +68,7 @@ class FirstRunWizard(QDialog):
             "for polite API access. It is not shared with any other service."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: grey; font-size: 11px;")
+        note.setStyleSheet("color: #706860; font-size: 8pt;")
 
         layout.addLayout(form)
         layout.addWidget(note)
@@ -100,6 +101,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("PaperBase")
     app.setOrganizationName("PaperBase")
+    apply_theme(app)
 
     data = _data_dir()
     settings_path = data / "settings.json"

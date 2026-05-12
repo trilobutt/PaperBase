@@ -305,6 +305,20 @@ Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land
 
 ---
 
+## UI Theme
+
+All visual styling lives in `paperbase/ui/theme.py`. `apply_theme(app)` is called in `main.py`
+immediately after `QApplication()`. The colour palette is documented in comments at the top of
+that file.
+
+- Never hardcode colours in widget files; use object-name selectors or reference palette values.
+- Inline `setStyleSheet` on individual widgets is only acceptable for state-specific overrides
+  (e.g. TagChip hover, review badge) that cannot be expressed via global selectors.
+- Primary-action buttons get `setObjectName("primary")` to activate the orange accent style.
+- Accent colour: `#F26822` (orange). Dark base: `#1c1917`. Surface: `#242018`. Raised: `#3a3530`.
+
+---
+
 ## Code Style
 
 - Python 3.12 (`py -3.12`). Type hints on all signatures.
