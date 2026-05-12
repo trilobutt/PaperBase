@@ -28,6 +28,7 @@ Windows 10/11 only. No cross-platform requirement. Python 3.12 exactly (run via 
 | Database | SQLite via `sqlite3` / `aiosqlite` | Flat schema, instant single-row edits, no ORM |
 | HTTP client | `httpx` (async) | Used for Crossref and Unpaywall API calls |
 | Qt/asyncio bridge | `qasync` | Integrates Python asyncio event loop with Qt event loop |
+| Embedding / tagging | `sentence-transformers` (`all-MiniLM-L6-v2`) + `keybert` | CPU-friendly; ~23 MB model; no GPU required |
 | Build | `pyproject.toml` + PyInstaller | Single-directory distributable |
 
 ---
@@ -40,12 +41,13 @@ paperbase/
 ├── pyproject.toml
 ├── CLAUDE.md
 ├── ui/
-│   ├── main_window.py       # QMainWindow; three-panel layout (collection tree | results | detail)
-│   ├── search_panel.py      # Search bar, filter sidebar, QTableView results
-│   ├── paper_detail.py      # Right panel: editable metadata fields, tag chips, open PDF button
-│   ├── import_dialog.py     # Batch import: drop PDFs, paste DOIs, paste URLs; progress per item
-│   ├── collection_tree.py   # Left panel: hierarchical QTreeView of collections
-│   └── settings_dialog.py   # Library root path, folder naming pattern, user email for APIs
+│   ├── main_window.py            # QMainWindow; three-panel layout (collection tree | results | detail)
+│   ├── search_panel.py           # Search bar, filter sidebar, QTableView results
+│   ├── paper_detail.py           # Right panel: editable metadata fields, tag chips, open PDF button
+│   ├── import_dialog.py          # Batch import: drop PDFs, paste DOIs, paste URLs; progress per item
+│   ├── collection_tree.py        # Left panel: hierarchical QTreeView of collections
+│   ├── settings_dialog.py        # Library root path, folder naming pattern, user email for APIs
+│   └── categorisation_dialog.py  # Progress dialog for retroactive categorisation run
 ├── core/
 │   ├── db.py                # SQLite schema creation, all CRUD queries, no ORM
 │   ├── indexer.py           # Tantivy index: build, incremental update, search, field schema
@@ -54,7 +56,8 @@ paperbase/
 │   ├── downloader.py        # Unpaywall API lookup; PDF download with content-type verification
 │   ├── organiser.py         # File copy/rename/sort according to naming pattern
 │   ├── importer.py          # Orchestrates metadata + download + organise pipelines; worker thread
-│   └── llm.py               # STUB ONLY: LLM categorisation hook, not implemented in v1
+│   ├── categoriser.py       # EmbeddingCategoriser (sentence-transformers) + CategorizationWorker
+│   └── llm.py               # Thin adapter over EmbeddingCategoriser; not used directly anywhere
 └── models/
     ├── paper.py             # Paper dataclass
     ├── collection.py        # Collection dataclass
@@ -632,28 +635,21 @@ times. Requirements:
   and updated incrementally).
 - Clicking a tag filters the results panel to papers containing that tag.
 
-### LLM Categorisation Stub (`core/llm.py`)
+### Auto-Categorisation (`core/categoriser.py`)
 
-```python
-class LLMCategoriser:
-    """
-    Stub for v1. Provides the interface that v2 will implement.
-    """
-    def categorise(
-        self,
-        paper: Paper,
-        target_collections: list[str],
-        existing_tags: list[str],
-    ) -> tuple[Optional[str], list[str]]:
-        """
-        Returns (suggested_collection_name, suggested_tags).
-        In v1: always returns (None, []).
-        In v2: send paper.title + paper.abstract to an LLM API with a structured prompt
-        instructing it to select from target_collections and suggest tags.
-        Results shown to user for review before being applied.
-        """
-        return None, []
-```
+- `EmbeddingCategoriser`: owned by `MainWindow`, passed to `ImportDialog` and `CategorizationDialog`.
+  Uses `threading.Lock` around all inference calls — safe to share across concurrent QThreads.
+- `load_model()` is blocking; always call from a worker thread or a daemon `threading.Thread`.
+  `MainWindow` preloads silently at startup if `auto_categorise=True` and categories are non-empty.
+- `categorise_paper()` returns `(collection_ids, tags)` to merge (never replace) onto the paper.
+  It creates missing top-level collections in the DB automatically by name.
+- `CategorizationWorker(QThread)`: retroactive batch; persists state to
+  `{library_root}/categorisation_state.json` (alongside `import_state.json`).
+- `core/llm.py` is a thin adapter over `EmbeddingCategoriser` kept for interface compatibility;
+  it is not imported anywhere in the app — do not treat it as the primary entry point.
+- Embedding model: `all-MiniLM-L6-v2` (~23 MB). Cached in `~/.cache/torch/sentence_transformers/`
+  after first download. Do NOT switch to Qwen3-Embedding-0.6B (0.6B params ≈ 27× slower on CPU).
+  `BAAI/bge-small-en-v1.5` is the quality upgrade path that remains CPU-feasible.
 
 ---
 
@@ -714,6 +710,8 @@ dependencies = [
     "platformdirs>=4.2",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
+    "sentence-transformers>=3.0",
+    "keybert>=0.8",
 ]
 
 [project.optional-dependencies]
@@ -806,6 +804,13 @@ First place to look when debugging index corruption or a missing/empty DB.
   and two in `_import_landing_page` (scrape-direct path and Unpaywall path).
 - Any post-placement hook (e.g. secondary copy) must be added after all 5. `paper.file_path` is
   updated in-place by `place_file`, so read it immediately after the call.
+- `_apply_categorisation(paper)` follows the same pattern: called at all 5 `insert_paper` sites,
+  immediately after `paper.id = paper_id`. Add any future post-insert hook at all 5 sites.
+
+### Dialog cache invalidation in MainWindow
+- `_open_settings` sets `_import_dialog = None` and `_cat_dialog = None` after saving.
+  This is intentional: both dialogs cache `categoriser` settings at construction time, so
+  they must be recreated after settings change. Do not add lazy-init guards that skip this reset.
 
 ### Windows file actions
 - Reveal in Explorer with file selected: `subprocess.Popen(["explorer", "/select," + file_path])`
