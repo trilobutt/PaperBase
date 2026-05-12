@@ -22,7 +22,7 @@ _STYLESHEET = """
    Base
    ================================================================ */
 QWidget {
-    background-color: #0D1B2A;
+    background-color: #0D0D0D;
     color: #e0d8cc;
     font-family: "Segoe UI", sans-serif;
     font-size: 9pt;
@@ -36,12 +36,16 @@ QDialog {
     background-color: #0D1B2A;
 }
 
+QDialog QWidget {
+    background-color: #0D1B2A;
+}
+
 /* ================================================================
    Toolbar
    ================================================================ */
 QToolBar {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1A3A58, stop:1 #102030);
+                    stop:0 #181818, stop:1 #0D0D0D);
     border: none;
     border-bottom: 1px solid #060F1A;
     padding: 3px 6px;
@@ -203,16 +207,16 @@ QDoubleSpinBox::down-button:hover {
    ================================================================ */
 QTableView,
 QTableWidget {
-    background-color: #07111C;
-    alternate-background-color: #0A1826;
+    background-color: #0D0D0D;
+    alternate-background-color: #111111;
     color: #e0d8cc;
     border-style: solid;
     border-width: 1px;
     border-top-color: #030A12;
     border-left-color: #030A12;
-    border-bottom-color: #172D44;
-    border-right-color: #172D44;
-    gridline-color: #0F2035;
+    border-bottom-color: #1A3048;
+    border-right-color: #1A3048;
+    gridline-color: #1A1A1A;
     selection-background-color: #F26822;
     selection-color: #ffffff;
     outline: none;
@@ -220,7 +224,7 @@ QTableWidget {
 
 QTableView::item:hover,
 QTableWidget::item:hover {
-    background-color: #142840;
+    background-color: #1A1A1A;
 }
 
 QTableView::item:selected,
@@ -230,12 +234,12 @@ QTableWidget::item:selected {
 }
 
 QHeaderView {
-    background-color: #102234;
+    background-color: #0D0D0D;
 }
 
 QHeaderView::section {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1A3A58, stop:1 #0C1C2E);
+                    stop:0 #1A1A1A, stop:1 #0F0F0F);
     color: #e0d8cc;
     border: none;
     border-right: 1px solid #1A3048;
@@ -245,7 +249,7 @@ QHeaderView::section {
 }
 
 QHeaderView::section:hover {
-    background: #1E4264;
+    background: #222222;
 }
 
 QHeaderView::section:first {

@@ -4,6 +4,7 @@ PaperBase entry point.
 First-run wizard collects library root, email, and confirmation of folder
 pattern, then opens MainWindow with import running in background.
 """
+import logging
 import sys
 from pathlib import Path
 
@@ -98,6 +99,13 @@ class FirstRunWizard(QDialog):
 
 
 def main() -> None:
+    debug = "--debug" in sys.argv
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.WARNING,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     app = QApplication(sys.argv)
     app.setApplicationName("PaperBase")
     app.setOrganizationName("PaperBase")
