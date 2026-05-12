@@ -1,12 +1,16 @@
 from typing import Optional
 
+from paperbase.core.categoriser import EmbeddingCategoriser
+from paperbase.core.db import Database
 from paperbase.models.paper import Paper
 
 
 class LLMCategoriser:
-    """
-    Stub for v1. Provides the interface that v2 will implement.
-    """
+    """Thin adapter preserving the original stub interface over EmbeddingCategoriser."""
+
+    def __init__(self, categoriser: EmbeddingCategoriser, db: Database) -> None:
+        self._categoriser = categoriser
+        self._db = db
 
     def categorise(
         self,
@@ -14,11 +18,10 @@ class LLMCategoriser:
         target_collections: list[str],
         existing_tags: list[str],
     ) -> tuple[Optional[str], list[str]]:
-        """
-        Returns (suggested_collection_name, suggested_tags).
-        v1: always returns (None, []).
-        v2: send paper.title + paper.abstract to an LLM API with a structured prompt
-        instructing it to select from target_collections and suggest tags.
-        Results shown to user for review before being applied.
-        """
-        return None, []
+        col_ids, tags = self._categoriser.categorise_paper(paper, self._db)
+        col_name: Optional[str] = None
+        if col_ids:
+            col = self._db.get_collection(col_ids[0])
+            if col:
+                col_name = col.name
+        return col_name, tags

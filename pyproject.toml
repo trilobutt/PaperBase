@@ -16,6 +16,8 @@ dependencies = [
     "platformdirs>=4.2",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
+    "sentence-transformers>=3.0",
+    "keybert>=0.8",
 ]
 
 [project.optional-dependencies]

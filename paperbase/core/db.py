@@ -266,6 +266,11 @@ class Database:
             tag_set.update(json.loads(row["tags"]))
         return sorted(tag_set)
 
+    def get_all_paper_ids(self) -> list[int]:
+        conn = self._conn_required()
+        rows = conn.execute("SELECT id FROM papers ORDER BY id").fetchall()
+        return [r["id"] for r in rows]
+
     def get_all_file_paths(self) -> list[str]:
         conn = self._conn_required()
         rows = conn.execute("SELECT file_path FROM papers").fetchall()

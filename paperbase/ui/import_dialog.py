@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QVBoxLayout, QWidget,
 )
 
+from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.importer import ImportWorker
 from paperbase.core.indexer import Indexer
@@ -28,6 +29,7 @@ class ImportDialog(QDialog):
         user_email: str,
         settings: Optional[Settings] = None,
         state_file: Optional[Path] = None,
+        categoriser: Optional[EmbeddingCategoriser] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -41,6 +43,7 @@ class ImportDialog(QDialog):
         self._user_email = user_email
         self._settings = settings
         self._state_file = state_file
+        self._categoriser = categoriser
         self._worker: Optional[ImportWorker] = None
         self._build_ui()
 
@@ -187,6 +190,7 @@ class ImportDialog(QDialog):
             state_file=self._state_file,
             folder_pattern=self._settings.folder_pattern,
             secondary_dest=secondary_dest,
+            categoriser=self._categoriser if self._settings and self._settings.auto_categorise else None,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(self._on_log)

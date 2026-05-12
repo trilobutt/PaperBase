@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -7,9 +8,11 @@ from PyQt6.QtWidgets import (
     QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
 )
 
+from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
 from paperbase.models.paper import Paper
+from paperbase.ui.categorisation_dialog import CategorizationDialog
 from paperbase.ui.collection_tree import CollectionTree
 from paperbase.ui.import_dialog import ImportDialog
 from paperbase.ui.paper_detail import PaperDetail
@@ -32,6 +35,18 @@ class MainWindow(QMainWindow):
         self._settings = settings
         self._settings_path = settings_path
         self._import_dialog: Optional[ImportDialog] = None
+        self._cat_dialog: Optional[CategorizationDialog] = None
+
+        self._categoriser = EmbeddingCategoriser()
+        self._categoriser.update_settings(
+            categories=settings.categories,
+            threshold=settings.category_threshold,
+            tag_count=settings.tag_count,
+        )
+        # Preload the model in the background so it's ready for new imports.
+        if settings.auto_categorise and settings.categories:
+            threading.Thread(target=self._categoriser.load_model, daemon=True).start()
+
         self.setWindowTitle("PaperBase")
         self.setMinimumSize(1100, 680)
         self._build_ui()
@@ -58,6 +73,11 @@ class MainWindow(QMainWindow):
         import_btn = QPushButton("Import")
         import_btn.clicked.connect(self._open_import)
         toolbar.addWidget(import_btn)
+
+        categorise_btn = QPushButton("Categorise")
+        categorise_btn.setToolTip("Auto-categorise and tag all papers using text embeddings")
+        categorise_btn.clicked.connect(self._open_categorise)
+        toolbar.addWidget(categorise_btn)
 
         settings_btn = QPushButton("⚙")
         settings_btn.setToolTip("Settings")
@@ -151,6 +171,7 @@ class MainWindow(QMainWindow):
                 user_email=self._settings.user_email,
                 settings=self._settings,
                 state_file=state_file,
+                categoriser=self._categoriser,
                 parent=self,
             )
             self._import_dialog.import_finished.connect(self.refresh_all)
@@ -160,11 +181,40 @@ class MainWindow(QMainWindow):
         self._import_dialog.show()
         self._import_dialog.raise_()
 
+    def _open_categorise(self) -> None:
+        if not self._settings.is_configured():
+            self._open_settings()
+            if not self._settings.is_configured():
+                return
+
+        if self._cat_dialog is None:
+            state_file = Path(self._settings.library_root) / "categorisation_state.json"
+            self._cat_dialog = CategorizationDialog(
+                db=self._db,
+                categoriser=self._categoriser,
+                state_file=state_file,
+                parent=self,
+            )
+            self._cat_dialog.finished.connect(self.refresh_all)
+        self._cat_dialog.show()
+        self._cat_dialog.raise_()
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, self)
         if dlg.exec():
             self._settings.save(self._settings_path)
             self._detail_panel.set_user_email(self._settings.user_email)
+            self._categoriser.update_settings(
+                categories=self._settings.categories,
+                threshold=self._settings.category_threshold,
+                tag_count=self._settings.tag_count,
+            )
+            # If categories were just configured for the first time, preload the model.
+            if self._settings.auto_categorise and self._settings.categories:
+                threading.Thread(target=self._categoriser.load_model, daemon=True).start()
+            # ImportDialog is cached; invalidate it so it picks up the new categoriser state.
+            self._import_dialog = None
+            self._cat_dialog = None
             self._refresh_status()
 
     def _refresh_status(self) -> None:

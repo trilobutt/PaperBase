@@ -19,6 +19,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.downloader import download_pdf_direct, download_via_unpaywall
 from paperbase.core.indexer import Indexer
@@ -63,6 +64,7 @@ class ImportWorker(QThread):
         state_file: Optional[Path] = None,
         folder_pattern: str = DEFAULT_PATTERN,
         secondary_dest: Optional[Path] = None,
+        categoriser: Optional[EmbeddingCategoriser] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -75,9 +77,25 @@ class ImportWorker(QThread):
         self._state_file = state_file
         self._folder_pattern = folder_pattern
         self._secondary_dest = secondary_dest
+        self._categoriser = categoriser
         self._pause_requested = False
         self._stop_requested = False
         self._tmp_dir = library_root / "tmp"
+
+    def _apply_categorisation(self, paper: Paper) -> None:
+        """Merge auto-categorisation results onto paper and update DB. No-op if not configured."""
+        if self._categoriser is None or not self._categoriser.is_loaded:
+            return
+        try:
+            col_ids, tags = self._categoriser.categorise_paper(paper, self._db)
+            new_col_ids = list(set(paper.collection_ids) | set(col_ids))
+            new_tags = list(set(paper.tags) | set(tags))
+            if new_col_ids != paper.collection_ids or new_tags != paper.tags:
+                paper.collection_ids = new_col_ids
+                paper.tags = new_tags
+                self._db.update_paper(paper)
+        except Exception as e:
+            logger.warning("Auto-categorisation failed for paper %s: %s", paper.id, e)
 
     def request_pause(self) -> None:
         self._pause_requested = True
@@ -204,6 +222,7 @@ class ImportWorker(QThread):
         fulltext = extract_fulltext(path)
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
+        self._apply_categorisation(paper)
         self._indexer.add_document(paper, fulltext)
         self._indexer.commit()
 
@@ -237,6 +256,7 @@ class ImportWorker(QThread):
         fulltext = extract_fulltext(Path(paper.file_path))
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
+        self._apply_categorisation(paper)
         self._indexer.add_document(paper, fulltext)
         self._indexer.commit()
 
@@ -287,6 +307,7 @@ class ImportWorker(QThread):
         fulltext = extract_fulltext(Path(paper.file_path))
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
+        self._apply_categorisation(paper)
         self._indexer.add_document(paper, fulltext)
         self._indexer.commit()
 
@@ -334,6 +355,7 @@ class ImportWorker(QThread):
                 fulltext = extract_fulltext(Path(paper.file_path))
                 paper_id = self._db.insert_paper(paper)
                 paper.id = paper_id
+                self._apply_categorisation(paper)
                 self._indexer.add_document(paper, fulltext)
                 self._indexer.commit()
                 self.item_finished.emit(url, True, paper.needs_review)
@@ -354,6 +376,7 @@ class ImportWorker(QThread):
                 fulltext = extract_fulltext(Path(paper.file_path))
                 paper_id = self._db.insert_paper(paper)
                 paper.id = paper_id
+                self._apply_categorisation(paper)
                 self._indexer.add_document(paper, fulltext)
                 self._indexer.commit()
                 self.item_finished.emit(url, True, paper.needs_review)
