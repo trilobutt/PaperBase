@@ -27,8 +27,8 @@ class TagChip(QPushButton):
         self._tag = tag
         self.setFlat(True)
         self.setStyleSheet(
-            "QPushButton { background: #3a3530; color: #e0d8cc; border-radius: 10px;"
-            " border: 1px solid #4a4540; padding: 2px 8px; font-size: 12px; }"
+            "QPushButton { background: #163046; color: #e0d8cc; border-radius: 10px;"
+            " border: 1px solid #1A3048; padding: 2px 8px; font-size: 12px; }"
             " QPushButton:hover { background: #F26822; color: #ffffff; border-color: #c44f10; }"
         )
         self.clicked.connect(lambda: self.removed.emit(self._tag))

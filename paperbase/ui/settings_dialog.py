@@ -122,7 +122,7 @@ class SettingsDialog(QDialog):
             "Pattern tokens: {journal} {year} {author} {title}\n"
             "Unresolved tokens are replaced with 'Unknown' or 'Unsorted'."
         )
-        pattern_note.setStyleSheet("color: #706860; font-size: 8pt;")
+        pattern_note.setStyleSheet("color: #6888A0; font-size: 8pt;")
         form.addRow("", pattern_note)
 
         layout.addWidget(general_box)
@@ -162,7 +162,7 @@ class SettingsDialog(QDialog):
             "to calibrate the embedding; richer descriptions improve accuracy."
         )
         cat_label.setWordWrap(True)
-        cat_label.setStyleSheet("color: #706860; font-size: 8pt;")
+        cat_label.setStyleSheet("color: #6888A0; font-size: 8pt;")
         cat_layout.addWidget(cat_label)
 
         self._cat_table = QTableWidget(0, 2)

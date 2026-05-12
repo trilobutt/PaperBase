@@ -120,8 +120,8 @@ class SearchPanel(QWidget):
         sidebar = QWidget()
         sidebar.setFixedWidth(170)
         sidebar.setStyleSheet(
-            "QWidget { background-color: #1c1917; border-right: 1px solid #141210; }"
-            " QLabel { background: transparent; color: #706860; font-size: 8pt;"
+            "QWidget { background-color: #0D0D0D; border-right: 1px solid #060F1A; }"
+            " QLabel { background: transparent; color: #6888A0; font-size: 8pt;"
             " font-weight: bold; margin-top: 4px; }"
         )
         sbl = QVBoxLayout(sidebar)

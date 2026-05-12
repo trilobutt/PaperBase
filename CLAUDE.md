@@ -315,7 +315,7 @@ that file.
 - Inline `setStyleSheet` on individual widgets is only acceptable for state-specific overrides
   (e.g. TagChip hover, review badge) that cannot be expressed via global selectors.
 - Primary-action buttons get `setObjectName("primary")` to activate the orange accent style.
-- Accent colour: `#F26822` (orange). Dark base: `#1c1917`. Surface: `#242018`. Raised: `#3a3530`.
+- Accent colour: `#F26822` (orange). Root bg: `#0D0D0D`. Surface: `#0D1B2A` (deep dark blue). Raised: `#163046`. TEXT_DIM: `#6888A0`.
 
 ---
 
