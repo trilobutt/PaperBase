@@ -172,6 +172,11 @@ class ImportDialog(QDialog):
         self._progress_bar.setValue(0)
         self._lbl_queued.setText(f"Queued: {len(items)}")
 
+        secondary_dest = (
+            Path(self._settings.secondary_dest)
+            if self._settings and self._settings.secondary_dest
+            else None
+        )
         self._worker = ImportWorker(
             mode=mode,
             items=items,
@@ -181,6 +186,7 @@ class ImportDialog(QDialog):
             user_email=self._user_email,
             state_file=self._state_file,
             folder_pattern=self._settings.folder_pattern,
+            secondary_dest=secondary_dest,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(self._on_log)

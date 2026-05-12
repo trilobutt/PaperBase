@@ -88,3 +88,15 @@ def place_file(
 
     paper.file_path = str(dest)
     return dest
+
+
+def copy_to_secondary(primary_dest: Path, library_root: Path, secondary_root: Path) -> None:
+    """Mirror a placed file to a secondary destination, preserving the relative path."""
+    try:
+        relative = primary_dest.relative_to(library_root)
+    except ValueError:
+        logger.warning("Cannot mirror %s: not under library root %s", primary_dest, library_root)
+        return
+    dest = secondary_root / relative
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(primary_dest), str(dest))

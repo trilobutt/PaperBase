@@ -795,6 +795,18 @@ First place to look when debugging index corruption or a missing/empty DB.
 - `DEFAULT_PATTERN` is exported from `organiser.py` as the canonical fallback.
 - Papers with `metadata_source in ("xmp", "filename")` bypass the pattern entirely and land in `Unsorted/`.
 
+### Adding a new Settings field
+- Touch 5 places: `Settings.__init__` (default), `Settings.save` (key), `Settings.load` (get),
+  `SettingsDialog._build_ui` (widget), `SettingsDialog._accept` (write-back).
+- If the field is consumed by `ImportWorker`, also add it to `ImportWorker.__init__` and pass it
+  from `ImportDialog._start_import` (which reads from `self._settings` at start time).
+
+### `place_file` call sites in importer.py
+- Exactly 5 sites across 3 methods: `_import_pdf`, `_import_doi`, `_import_direct_pdf_url`,
+  and two in `_import_landing_page` (scrape-direct path and Unpaywall path).
+- Any post-placement hook (e.g. secondary copy) must be added after all 5. `paper.file_path` is
+  updated in-place by `place_file`, so read it immediately after the call.
+
 ### Smoke-testing without a test suite
 - `py -3.12 -c "from paperbase.xxx import yyy; print('OK')"` is the fastest correctness check.
   Run after any change that touches imports or dataclass fields.

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QLabel,
+    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -16,6 +16,7 @@ class Settings:
         self.user_email: str = ""
         self.folder_pattern: str = "{journal}/{year}/{author} ({year}) {title}.pdf"
         self.last_import_dir: str = ""
+        self.secondary_dest: str = ""
 
     def is_configured(self) -> bool:
         return bool(self.library_root and self.user_email)
@@ -27,6 +28,7 @@ class Settings:
             "user_email": self.user_email,
             "folder_pattern": self.folder_pattern,
             "last_import_dir": self.last_import_dir,
+            "secondary_dest": self.secondary_dest,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -40,6 +42,7 @@ class Settings:
                 s.user_email = data.get("user_email", "")
                 s.folder_pattern = data.get("folder_pattern", s.folder_pattern)
                 s.last_import_dir = data.get("last_import_dir", "")
+                s.secondary_dest = data.get("secondary_dest", "")
             except Exception:
                 pass
         return s
@@ -59,7 +62,7 @@ class SettingsDialog(QDialog):
 
         # Library root
         root_row = QWidget()
-        root_hl = __import__("PyQt6.QtWidgets", fromlist=["QHBoxLayout"]).QHBoxLayout(root_row)
+        root_hl = QHBoxLayout(root_row)
         root_hl.setContentsMargins(0, 0, 0, 0)
         self._root_edit = QLineEdit(self._settings.library_root)
         browse_btn = QPushButton("Browse…")
@@ -76,6 +79,21 @@ class SettingsDialog(QDialog):
         # Folder pattern
         self._pattern_edit = QLineEdit(self._settings.folder_pattern)
         form.addRow("Folder pattern:", self._pattern_edit)
+
+        # Secondary copy destination (optional)
+        sec_row = QWidget()
+        sec_hl = QHBoxLayout(sec_row)
+        sec_hl.setContentsMargins(0, 0, 0, 0)
+        self._secondary_dest_edit = QLineEdit(self._settings.secondary_dest)
+        self._secondary_dest_edit.setPlaceholderText("Leave blank to disable")
+        sec_browse_btn = QPushButton("Browse…")
+        sec_browse_btn.clicked.connect(self._browse_secondary_dest)
+        sec_clear_btn = QPushButton("Clear")
+        sec_clear_btn.clicked.connect(self._secondary_dest_edit.clear)
+        sec_hl.addWidget(self._secondary_dest_edit)
+        sec_hl.addWidget(sec_browse_btn)
+        sec_hl.addWidget(sec_clear_btn)
+        form.addRow("Secondary copy destination:", sec_row)
 
         note = QLabel(
             "Pattern tokens: {journal} {year} {author} {title}\n"
@@ -99,8 +117,17 @@ class SettingsDialog(QDialog):
         if path:
             self._root_edit.setText(path)
 
+    def _browse_secondary_dest(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Secondary Copy Destination",
+            self._secondary_dest_edit.text() or str(Path.home()),
+        )
+        if path:
+            self._secondary_dest_edit.setText(path)
+
     def _accept(self) -> None:
         self._settings.library_root = self._root_edit.text().strip()
         self._settings.user_email = self._email_edit.text().strip()
         self._settings.folder_pattern = self._pattern_edit.text().strip()
+        self._settings.secondary_dest = self._secondary_dest_edit.text().strip()
         self.accept()

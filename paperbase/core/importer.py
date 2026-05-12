@@ -31,7 +31,7 @@ from paperbase.core.metadata import (
     resolve_book_metadata,
     resolve_metadata,
 )
-from paperbase.core.organiser import DEFAULT_PATTERN, place_file
+from paperbase.core.organiser import DEFAULT_PATTERN, copy_to_secondary, place_file
 from paperbase.core.scraper import ScrapeResult, classify_url, scrape_landing_page
 from paperbase.models.paper import Paper
 
@@ -62,6 +62,7 @@ class ImportWorker(QThread):
         user_email: str,
         state_file: Optional[Path] = None,
         folder_pattern: str = DEFAULT_PATTERN,
+        secondary_dest: Optional[Path] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -73,6 +74,7 @@ class ImportWorker(QThread):
         self._user_email = user_email
         self._state_file = state_file
         self._folder_pattern = folder_pattern
+        self._secondary_dest = secondary_dest
         self._pause_requested = False
         self._stop_requested = False
         self._tmp_dir = library_root / "tmp"
@@ -197,6 +199,8 @@ class ImportWorker(QThread):
             paper = await guess_metadata_from_text(path, self._user_email, rl)
 
         place_file(path, paper, self._library_root, move=False, folder_pattern=self._folder_pattern)
+        if self._secondary_dest:
+            copy_to_secondary(Path(paper.file_path), self._library_root, self._secondary_dest)
         fulltext = extract_fulltext(path)
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
@@ -228,6 +232,8 @@ class ImportWorker(QThread):
         paper.open_access = True
 
         place_file(result.tmp_path, paper, self._library_root, move=True, folder_pattern=self._folder_pattern)  # type: ignore[arg-type]
+        if self._secondary_dest:
+            copy_to_secondary(Path(paper.file_path), self._library_root, self._secondary_dest)
         fulltext = extract_fulltext(Path(paper.file_path))
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
@@ -276,6 +282,8 @@ class ImportWorker(QThread):
         paper.open_access = False
 
         place_file(tmp, paper, self._library_root, move=True, folder_pattern=self._folder_pattern)  # type: ignore[arg-type]
+        if self._secondary_dest:
+            copy_to_secondary(Path(paper.file_path), self._library_root, self._secondary_dest)
         fulltext = extract_fulltext(Path(paper.file_path))
         paper_id = self._db.insert_paper(paper)
         paper.id = paper_id
@@ -321,6 +329,8 @@ class ImportWorker(QThread):
                     paper = scrape.metadata or await guess_metadata_from_text(tmp, self._user_email, rl)  # type: ignore[arg-type]
                 paper.open_access = scrape.is_open_access
                 place_file(tmp, paper, self._library_root, move=True, folder_pattern=self._folder_pattern)  # type: ignore[arg-type]
+                if self._secondary_dest:
+                    copy_to_secondary(Path(paper.file_path), self._library_root, self._secondary_dest)
                 fulltext = extract_fulltext(Path(paper.file_path))
                 paper_id = self._db.insert_paper(paper)
                 paper.id = paper_id
@@ -339,6 +349,8 @@ class ImportWorker(QThread):
                     paper = await guess_metadata_from_text(dl.tmp_path, self._user_email, rl)  # type: ignore[arg-type]
                 paper.open_access = True
                 place_file(dl.tmp_path, paper, self._library_root, move=True, folder_pattern=self._folder_pattern)  # type: ignore[arg-type]
+                if self._secondary_dest:
+                    copy_to_secondary(Path(paper.file_path), self._library_root, self._secondary_dest)
                 fulltext = extract_fulltext(Path(paper.file_path))
                 paper_id = self._db.insert_paper(paper)
                 paper.id = paper_id
