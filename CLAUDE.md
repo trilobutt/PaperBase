@@ -3,33 +3,60 @@
 ## Project Overview
 
 PaperBase is a Windows desktop application for managing a library of ~130,000 academic paper PDFs.
-It replaces the Zotero + ZotMoov + DocFetcher toolchain with a single fast application that:
+Replaces Zotero + ZotMoov + DocFetcher with a single application providing:
+full-text search (Tantivy BM25), DOI/ISBN extraction, Crossref/Open Library/Unpaywall metadata,
+landing page scraping, and file organisation into a configurable folder hierarchy.
+Metadata stored in a flat SQLite schema (no normalised tables — hard architectural constraint).
 
-- Provides blazing full-text search across all PDFs (Tantivy, Lucene-class inverted index)
-- Extracts DOIs from PDFs via text heuristics and resolves full metadata from Crossref
-- Downloads open-access PDFs via Unpaywall when given DOIs or URLs
-- Organises PDFs into a folder hierarchy according to configurable naming patterns
-- Stores metadata in a flat SQLite schema (no normalised author/journal tables — this is a hard architectural constraint)
-- Supports hierarchical collections and free-form tags, with stub hooks for LLM auto-categorisation
+**Platform:** Windows 10/11 only. Python 3.12 exactly (`py -3.12`).
 
-## Target Platform
+---
 
-Windows 10/11 only. No cross-platform requirement. Python 3.12 exactly (run via `py -3.12`; no other version is supported).
+## NEVER
+
+- Never add normalised tables (authors, journals, keywords, or any repeating string). Every field is stored flat on the `papers` row or as a JSON array. Metadata editing must be a single `UPDATE papers SET field=? WHERE id=?` with no joins.
+- Never add BibTeX, RIS, or citation export.
+- Never add a built-in PDF viewer — use `os.startfile(path)`.
+- Never add cloud sync, web server, or any network-facing interface.
+- Never use Sci-Hub or any OA source other than Unpaywall.
+- Never add citation graph, reference parsing, or related-paper discovery.
+- Never use `os.path`; use `pathlib.Path` throughout.
+- Never call UI methods from worker threads; use Qt signals exclusively.
+- Never add Linux/macOS support.
+- Never add new dependencies without asking first.
+
+---
+
+## Commands
+
+```
+# Install and run
+pip install -e .
+py -3.12 -m paperbase.main
+
+# Smoke-test after any import or dataclass change
+py -3.12 -c "from paperbase.xxx import yyy; print('OK')"
+
+# Debug DB directly (replace DOI as needed)
+py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"
+```
+
+**Runtime data dir:** `%LOCALAPPDATA%\PaperBase\PaperBase\` — `paperbase.db`, `index/`, `settings.json`.
+`import_state.json` and `categorisation_state.json` live at `{library_root}/` (alongside PDFs, not in app data dir).
 
 ---
 
 ## Technology Stack
 
-| Layer | Choice | Rationale |
+| Layer | Choice | Notes |
 |---|---|---|
-| UI | PyQt6 | Native Qt6 widgets; no Electron |
-| Full-text search | `tantivy` (tantivy-py) | Rust inverted index, matches Lucene performance, pre-built Windows wheel, no JVM |
-| PDF text extraction | `PyMuPDF` (fitz) | Fast, accurate, exposes XMP metadata and page text |
-| Database | SQLite via `sqlite3` / `aiosqlite` | Flat schema, instant single-row edits, no ORM |
-| HTTP client | `httpx` (async) | Used for Crossref and Unpaywall API calls |
-| Qt/asyncio bridge | `qasync` | Integrates Python asyncio event loop with Qt event loop |
-| Embedding / tagging | `sentence-transformers` (`all-MiniLM-L6-v2`) + `keybert` | CPU-friendly; ~23 MB model; no GPU required |
-| Build | `pyproject.toml` + PyInstaller | Single-directory distributable |
+| UI | PyQt6 | Native Qt6, no Electron |
+| Full-text search | `tantivy` (tantivy-py) | Rust BM25, pre-built Windows wheel, no JVM |
+| PDF text extraction | `PyMuPDF` (fitz) | XMP metadata + page text |
+| Database | SQLite (`sqlite3` / `aiosqlite`) | Flat schema, no ORM |
+| HTTP client | `httpx` (async) | Crossref, Unpaywall, scraping |
+| Qt/asyncio bridge | `qasync` | Main-thread asyncio loop |
+| Embedding / tagging | `sentence-transformers` `all-MiniLM-L6-v2` + `keybert` | CPU-only, ~23 MB |
 
 ---
 
@@ -37,63 +64,60 @@ Windows 10/11 only. No cross-platform requirement. Python 3.12 exactly (run via 
 
 ```
 paperbase/
-├── main.py                  # Entry point: creates QApplication, initialises core, launches MainWindow
-├── pyproject.toml
-├── CLAUDE.md
+├── main.py
 ├── ui/
-│   ├── main_window.py            # QMainWindow; three-panel layout (collection tree | results | detail)
-│   ├── search_panel.py           # Search bar, filter sidebar, QTableView results
-│   ├── paper_detail.py           # Right panel: editable metadata fields, tag chips, open PDF button
-│   ├── import_dialog.py          # Batch import: drop PDFs, paste DOIs, paste URLs; progress per item
-│   ├── collection_tree.py        # Left panel: hierarchical QTreeView of collections
-│   ├── settings_dialog.py        # Library root path, folder naming pattern, user email for APIs
-│   └── categorisation_dialog.py  # Progress dialog for retroactive categorisation run
+│   ├── main_window.py            # QMainWindow; three-panel layout
+│   ├── search_panel.py           # Search bar, filters, QTableView + PaperTableModel
+│   ├── paper_detail.py           # Editable metadata fields, tag chips
+│   ├── import_dialog.py          # Batch import: drop PDFs / paste DOIs / paste URLs
+│   ├── collection_tree.py        # Left panel: hierarchical QTreeView
+│   ├── settings_dialog.py        # Library root, folder pattern, user email
+│   └── categorisation_dialog.py  # Progress dialog for retroactive categorisation
 ├── core/
-│   ├── db.py                # SQLite schema creation, all CRUD queries, no ORM
-│   ├── indexer.py           # Tantivy index: build, incremental update, search, field schema
-│   ├── metadata.py          # DOI extraction from PDF text; Crossref REST API lookup
-│   ├── scraper.py           # Landing page scraping: Highwire/Dublin Core/JSON-LD/COinS meta tags
-│   ├── downloader.py        # Unpaywall API lookup; PDF download with content-type verification
-│   ├── organiser.py         # File copy/rename/sort according to naming pattern
-│   ├── importer.py          # Orchestrates metadata + download + organise pipelines; worker thread
-│   ├── categoriser.py       # EmbeddingCategoriser (sentence-transformers) + CategorizationWorker
-│   └── llm.py               # Thin adapter over EmbeddingCategoriser; not used directly anywhere
+│   ├── db.py          # SQLite schema + all CRUD; no ORM
+│   ├── indexer.py     # Tantivy: build, incremental update, search
+│   ├── metadata.py    # DOI extraction from PDF text; Crossref + book metadata lookup
+│   ├── scraper.py     # Landing page: Highwire/DC/JSON-LD/OG meta scraping
+│   ├── downloader.py  # Unpaywall lookup + PDF download
+│   ├── organiser.py   # File copy/move per naming pattern; compute_destination
+│   ├── importer.py    # ImportWorker(QThread): orchestrates all pipelines
+│   ├── categoriser.py # EmbeddingCategoriser + CategorizationWorker
+│   └── llm.py         # Dead code — thin adapter over EmbeddingCategoriser, not imported anywhere
 └── models/
-    ├── paper.py             # Paper dataclass
-    ├── collection.py        # Collection dataclass
-    └── search_result.py     # SearchResult dataclass (paper_id, title, snippet, score)
+    ├── paper.py
+    ├── collection.py
+    └── search_result.py
 ```
 
 ---
 
 ## SQLite Schema
 
-**Critical constraint: NO normalised tables for authors, journals, keywords, or any other repeating
-string values. Every field that could be normalised in a conventional relational schema MUST be
-stored as plain text or a JSON array directly on the `papers` row. This is the primary
-architectural divergence from Zotero and the reason metadata editing is instant.**
+**Hard constraint: NO normalised tables for authors, journals, keywords, or any repeating string.**
 
 ```sql
 CREATE TABLE IF NOT EXISTS papers (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     doi             TEXT UNIQUE,
     title           TEXT NOT NULL DEFAULT '',
-    authors         TEXT NOT NULL DEFAULT '[]',  -- JSON array of strings: ["Lastname, Firstname", ...]
-    journal         TEXT NOT NULL DEFAULT '',     -- plain text, no FK, no lookup table
+    authors         TEXT NOT NULL DEFAULT '[]',  -- JSON array: ["Lastname, Firstname", ...]
+    journal         TEXT NOT NULL DEFAULT '',     -- publisher name for books
     year            INTEGER,
     volume          TEXT NOT NULL DEFAULT '',
     issue           TEXT NOT NULL DEFAULT '',
     pages           TEXT NOT NULL DEFAULT '',
     abstract        TEXT NOT NULL DEFAULT '',
-    keywords        TEXT NOT NULL DEFAULT '[]',   -- JSON array from Crossref/XMP metadata
-    tags            TEXT NOT NULL DEFAULT '[]',   -- JSON array of user- or LLM-assigned tags
-    collection_ids  TEXT NOT NULL DEFAULT '[]',   -- JSON array of integer collection IDs
-    file_path       TEXT NOT NULL UNIQUE,         -- absolute path to PDF on disk
-    date_added      TEXT NOT NULL,                -- ISO8601 UTC
-    date_modified   TEXT NOT NULL,                -- ISO8601 UTC
-    metadata_source TEXT NOT NULL DEFAULT 'unknown',  -- "crossref", "xmp", "manual", "filename"
-    needs_review    INTEGER NOT NULL DEFAULT 0,   -- 1 = metadata incomplete or unresolved
-    open_access     INTEGER NOT NULL DEFAULT 0    -- 1 = confirmed open access via Unpaywall
+    keywords        TEXT NOT NULL DEFAULT '[]',
+    tags            TEXT NOT NULL DEFAULT '[]',
+    collection_ids  TEXT NOT NULL DEFAULT '[]',  -- JSON array of int collection IDs
+    file_path       TEXT NOT NULL UNIQUE,
+    date_added      TEXT NOT NULL,               -- ISO8601 UTC
+    date_modified   TEXT NOT NULL,
+    metadata_source TEXT NOT NULL DEFAULT 'unknown',
+    needs_review    INTEGER NOT NULL DEFAULT 0,
+    open_access     INTEGER NOT NULL DEFAULT 0,
+    isbn            TEXT,                        -- ISBN-13 preferred; populated for books
+    document_type   TEXT NOT NULL DEFAULT 'article'
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -103,32 +127,27 @@ CREATE TABLE IF NOT EXISTS collections (
     UNIQUE(name, parent_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_papers_doi   ON papers(doi);
-CREATE INDEX IF NOT EXISTS idx_papers_year  ON papers(year);
-CREATE INDEX IF NOT EXISTS idx_papers_title ON papers(title);
+CREATE INDEX IF NOT EXISTS idx_papers_doi          ON papers(doi);
+CREATE INDEX IF NOT EXISTS idx_papers_year         ON papers(year);
+CREATE INDEX IF NOT EXISTS idx_papers_title        ON papers(title);
 CREATE INDEX IF NOT EXISTS idx_papers_needs_review ON papers(needs_review);
 ```
 
-There is no `authors` table. There is no `journals` table. There is no `keywords` table.
-Editing an author name is a single `UPDATE papers SET authors=? WHERE id=?` — no joins, no lookups,
-no latency.
+`metadata_source` values: `"crossref"` | `"openlibrary"` | `"googlebooks"` | `"xmp"` | `"manual"` | `"filename"`.
+`document_type` values: `"article"` | `"book"` | `"book-chapter"` | `"proceedings"`.
 
 ---
 
 ## Data Models
 
 ```python
-# models/paper.py
-from dataclasses import dataclass, field
-from typing import Optional
-
 @dataclass
 class Paper:
     id: Optional[int]
     doi: Optional[str]
     title: str
-    authors: list[str]          # ["Lastname, Firstname", ...]
-    journal: str
+    authors: list[str]       # ["Lastname, Firstname", ...]
+    journal: str             # publisher name when document_type == "book"
     year: Optional[int]
     volume: str
     issue: str
@@ -138,17 +157,13 @@ class Paper:
     tags: list[str]
     collection_ids: list[int]
     file_path: str
-    date_added: str
+    date_added: str          # ISO8601 UTC
     date_modified: str
     metadata_source: str
     needs_review: bool
     open_access: bool
-
-@dataclass
-class Collection:
-    id: Optional[int]
-    name: str
-    parent_id: Optional[int]
+    isbn: Optional[str] = None        # keyword default — keeps construction sites without it valid
+    document_type: str = 'article'
 
 @dataclass
 class SearchResult:
@@ -157,414 +172,115 @@ class SearchResult:
     authors: list[str]
     journal: str
     year: Optional[int]
-    snippet: str                # Tantivy-generated excerpt with search terms highlighted
+    snippet: str   # Tantivy-generated excerpt with search terms highlighted
     score: float
 ```
 
----
-
-## Full-Text Search: Tantivy
-
-### Index Schema
-
-```python
-import tantivy
-
-def build_schema() -> tantivy.Schema:
-    builder = tantivy.SchemaBuilder()
-    builder.add_integer_field("paper_id", stored=True, indexed=True)
-    builder.add_text_field("title",    stored=True,  tokenizer_name="en_stem")
-    builder.add_text_field("abstract", stored=False, tokenizer_name="en_stem")
-    builder.add_text_field("authors",  stored=False, tokenizer_name="en_stem")
-    builder.add_text_field("keywords", stored=False, tokenizer_name="en_stem")
-    builder.add_text_field("fulltext", stored=False, tokenizer_name="en_stem")  # full PDF body
-    builder.add_integer_field("year",  stored=True,  indexed=True)
-    return builder.build()
-```
-
-`fulltext` is not stored in the index (it is large); only `title` is stored for snippet generation
-from search results. All other display metadata comes from SQLite by paper_id.
-
-### Index Lifecycle
-
-1. **First run**: User selects library root in settings. Indexer scans for all PDFs (already in DB
-   after the metadata import phase), extracts full text via PyMuPDF, indexes all documents.
-   Runs in a `QThread` worker with progress signal emitted per document.
-2. **Incremental update**: After any import that adds documents, `indexer.add_document()` is called
-   immediately. The Tantivy writer commits after each batch.
-3. **Search**: `indexer.search(query: str) -> list[SearchResult]`. Uses Tantivy's default BM25
-   query parser across all text fields. Returns paper_ids which are then fetched from SQLite for
-   full metadata. Results are uncapped — `searcher.num_docs` is passed as the limit to Tantivy.
-
-### Query syntax
-
-Tantivy's parser supports: `"exact phrase"`, `field:term` (fields: title, abstract, authors,
-keywords, fulltext), `AND`/`OR`/`NOT`, `+required -excluded`,
-`year:[2020 TO 2023]` (range on indexed integer fields), `word*` (prefix).
-Invalid syntax triggers a fallback that wraps the whole input in quotes (phrase search).
+New fields must be keyword arguments with defaults so existing `Paper(...)` call sites keep working.
+Extend schema via `ALTER TABLE papers ADD COLUMN ...` in `_migrate()` wrapped in `try/except sqlite3.OperationalError`.
 
 ---
 
-## DOI Extraction Pipeline
+## Full-Text Search (Tantivy)
 
-Replicates Zotero's documented approach. Implemented in `core/metadata.py`.
+Index fields: `paper_id` (stored, indexed int), `title` (stored text), `abstract`/`authors`/`keywords`/`fulltext` (not stored text), `year` (stored, indexed int).
 
-### Per-PDF extraction (`extract_doi_from_pdf(path: Path) -> Optional[str]`)
+`fulltext` is not stored; only `title` is available from the index. All other display metadata fetched from SQLite by `paper_id`.
 
-```
-1. Open PDF with fitz.open(path)
-2. Extract text from pages 0, 1, 2 (first three pages). Concatenate.
-3. Split into lines. Take first 100 lines.
-4. Apply DOI regex to each line:
-       pattern = r'\b(10\.\d{4,9}/[^\s"<>{|}\\^[\]`]+)'
-   Return first match found, stripped of trailing punctuation (.,;)).
-5. If no DOI found in first 100 lines, search entire first-page text.
-6. If still no DOI: check fitz Document.metadata dict for 'subject' or 'keywords'
-   fields which sometimes contain a DOI.
-7. Return None if no DOI found anywhere.
-```
+Query syntax: `"exact phrase"`, `field:term` (fields: title, abstract, authors, keywords, fulltext), `AND`/`OR`/`NOT`, `+required -excluded`, `year:[2020 TO 2023]`, `word*`. Invalid syntax falls back to whole-input phrase search.
 
-### Per-PDF metadata resolution (`resolve_metadata(doi: str) -> Optional[Paper]`)
+Results uncapped (`searcher.num_docs` as limit). Scores normalised 0–100 against top hit; blank column when no query is active.
 
-```
-1. Query Crossref: GET https://api.crossref.org/works/{doi}
-   Headers: {"User-Agent": "PaperBase/1.0 (mailto:{user_email})"}
-   (Polite pool: higher rate limits when mailto is supplied)
-2. On 200: parse JSON response:
-       message.title[0]         -> title
-       message.author           -> [f"{a['family']}, {a['given']}" for a in authors]
-       message.container-title  -> journal
-       message.published.date-parts[0][0] -> year
-       message.volume           -> volume
-       message.issue            -> issue
-       message.page             -> pages
-       message.abstract         -> abstract (strip JATS XML tags if present)
-       message.subject          -> keywords
-3. On 404 or no result: return None.
-4. On rate limit (429): back off with exponential retry, max 3 attempts.
-```
+---
 
-### Fallback when no DOI found (`guess_metadata_from_text(path: Path) -> Paper`)
+## DOI Extraction Pipeline (`core/metadata.py`)
 
-```
-1. Extract first-page text via PyMuPDF.
-2. Candidate title: the longest line in the first 20 lines that is >= 20 chars
-   and contains at least one space (avoids picking up author affiliation strings).
-3. Query Crossref bibliographic search:
-       GET https://api.crossref.org/works?query.bibliographic={title}&rows=3&select=DOI,title,author,...
-4. Take the first result if its title similarity to the candidate (using
-   difflib.SequenceMatcher ratio) is >= 0.75. If so, treat as a DOI match and
-   run full resolution.
-5. If similarity < 0.75: use XMP metadata from fitz.Document.metadata as fallback
-   (title, author keys). Mark metadata_source = "xmp", needs_review = True.
-6. If XMP also empty: use the PDF filename (strip extension, replace underscores/hyphens
-   with spaces) as the title. Mark metadata_source = "filename", needs_review = True.
-```
+**`extract_doi_from_pdf(path)`:** Regex `r'\b(10\.\d{4,9}/[^\s"<>{|}\\^[\]`]+)'` across first 3 pages (first 100 lines), then full first-page text, then `fitz.Document.metadata` subject/keywords fields. Strips trailing `.,;)`.
+
+**`resolve_metadata(doi)`:** GET `https://api.crossref.org/works/{doi}` with polite-pool User-Agent (`mailto:` included). Crossref legitimately returns `title: []`/`author: []` for some valid DOIs — these set `needs_review=True`. Exponential retry on 429, max 3 attempts.
+
+**`guess_metadata_from_text(path)`:** Candidate title = longest line ≥20 chars in first 20 lines. Queries Crossref bibliographic search; accepts result if `difflib.SequenceMatcher` ratio ≥0.75. Falls back to XMP metadata, then filename — both set `needs_review=True`.
+
+**Book metadata:** `journal` stores publisher name. Lookup order: Open Library → Google Books (both free, no API key). Import pipeline: DOI → ISBN → `resolve_book_metadata` → `guess_metadata_from_text`.
 
 ---
 
 ## Landing Page Scraper (`core/scraper.py`)
 
-Handles publisher/repository URLs where the user submits an article page rather than a direct
-PDF link. Replicates the core behaviour of Zotero's generic "Embedded Metadata" translator,
-which is triggered on any page that doesn't have a site-specific translator.
-
-### ScrapeResult dataclass
-
 ```python
 @dataclass
 class ScrapeResult:
-    doi:             Optional[str]   # extracted DOI, if found
-    pdf_url:         Optional[str]   # direct PDF link, if found
-    is_open_access:  bool            # True if citation_pdf_url or OA indicator was present
-    metadata:        Optional[Paper] # partial paper populated from page meta tags
-                                     # (used only if Crossref lookup fails; always try Crossref first)
-    source_url:      str             # original URL passed in
+    doi:            Optional[str]
+    pdf_url:        Optional[str]
+    is_open_access: bool
+    metadata:       Optional[Paper]  # fallback only if Crossref fails; always try Crossref first
+    source_url:     str
 ```
 
-### `scrape_landing_page(url: str) -> ScrapeResult`
+`scrape_landing_page(url)` extracts metadata in priority order:
 
-```
-1. Fetch URL with httpx.
-   User-Agent: "Mozilla/5.0 (compatible; PaperBase/1.0)"  -- bare-minimum spoofing; most
-   publishers block Python's default UA but accept a generic browser UA.
-   Follow up to 5 redirects. Timeout: 15s.
-   If response Content-Type is application/pdf: raise ValueError("direct_pdf") — caller
-   should reclassify and use the PDF pipeline instead.
+1. **Highwire Press tags** (`citation_doi`, `citation_pdf_url`, `citation_title`, `citation_author`, `citation_journal_title`, `citation_publication_date`, `citation_volume`, `citation_issue`, `citation_firstpage`/`citation_lastpage`, `citation_abstract`, `citation_keywords`) — covers Springer, Nature, Elsevier, Wiley, OUP, CUP, PLOS, PMC, arXiv, bioRxiv, ACS, RSC, IEEE. `citation_pdf_url` presence sets `is_open_access=True`.
+2. **Dublin Core** (`DC.identifier` → doi, `DC.title`, `DC.creator`, `DC.source` → journal, `DC.date`) — institutional repos, OJS.
+3. **JSON-LD** (`<script type="application/ld+json">`) — `@type` of `ScholarlyArticle`/`Article`/`CreativeWork`.
+4. **OpenGraph** (`og:title`, `og:description`) — title/abstract only if nothing found above.
+5. **DOI in URL** — regex `r'10\.\d{4,9}/'` against the URL itself.
 
-2. Parse HTML with BeautifulSoup(response.text, "lxml").
+**DOI normalisation:** strip `https://doi.org/` prefix, strip trailing punctuation, validate `r'^10\.\d{4,9}/'`.
 
-3. Extract metadata in the following priority order (highest quality first):
+**PDF URL verification (HEAD request):** confirm `Content-Type: application/pdf`. Login redirect (URL contains `login`/`sso`/`auth`/`signin`/`access`), non-PDF content type, 401/403, or network error → `pdf_url = None`.
 
-   PRIORITY 1 — Highwire Press / Google Scholar meta tags
-   (Used by Springer, Nature, Elsevier, Wiley, OUP, CUP, PLOS, PubMed Central, arXiv, bioRxiv,
-   and most major publishers. These are the most reliable and most commonly present.)
-
-   Tags to extract (all are <meta name="..." content="...">):
-     citation_doi              → doi
-     citation_pdf_url          → pdf_url (set is_open_access=True if present)
-     citation_title            → metadata.title
-     citation_author           → metadata.authors (may appear multiple times; collect all)
-     citation_journal_title    → metadata.journal
-     citation_publication_date → metadata.year (parse year from YYYY/MM/DD or YYYY)
-     citation_volume           → metadata.volume
-     citation_issue            → metadata.issue
-     citation_firstpage +
-     citation_lastpage         → metadata.pages as "{first}–{last}"
-     citation_abstract         → metadata.abstract
-     citation_keywords         → metadata.keywords (may be comma-separated single tag or multiple tags)
-     citation_fulltext_html_url → store as fallback; sometimes PDF is accessible from there
-
-   PRIORITY 2 — Dublin Core tags
-   (Fallback for institutional repositories, OJS journals, and older publisher sites.)
-
-   Tags to extract (all are <meta name="DC.xxx" content="..."> or <meta name="dc.xxx" ...>):
-     DC.identifier   → doi (if content matches DOI pattern r'10\.\d{4,9}/')
-     DC.title        → metadata.title (if not already set)
-     DC.creator      → metadata.authors (may appear multiple times)
-     DC.source       → metadata.journal (if not already set)
-     DC.date         → metadata.year
-
-   PRIORITY 3 — JSON-LD (application/ld+json script blocks)
-   (Increasingly common on modern publisher sites; parse any <script type="application/ld+json">
-   blocks and look for @type = "ScholarlyArticle" | "Article" | "CreativeWork".)
-
-   Fields to extract:
-     identifier (if DOI-shaped)   → doi
-     url (if contains /pdf/)      → pdf_url candidate (verify with HEAD request)
-     name / headline              → metadata.title
-     author[].name                → metadata.authors
-     isPartOf.name / publisher.name → metadata.journal
-     datePublished                → metadata.year
-
-   PRIORITY 4 — OpenGraph tags
-   (Low-quality for academic metadata but common fallback for title/abstract.)
-
-   Tags to extract (<meta property="og:xxx" content="...">):
-     og:title       → metadata.title (only if nothing found above)
-     og:description → metadata.abstract (only if nothing found above)
-
-   PRIORITY 5 — DOI in page URL
-   If the URL itself contains a DOI pattern (e.g. doi.org/10.xxxx/yyyy or
-   /doi/10.xxxx/yyyy), extract it. This covers doi.org redirects and many
-   publisher URL patterns (e.g. https://journals.plos.org/plosone/article?id=10.1371/...).
-
-4. DOI normalisation:
-   - Strip "https://doi.org/" prefix if present.
-   - Strip trailing punctuation.
-   - Validate against pattern r'^10\.\d{4,9}/' — discard if no match.
-
-5. PDF URL verification:
-   If pdf_url was found in meta tags, send a HEAD request to it.
-   - If HEAD returns Content-Type: application/pdf → confirmed, use as-is.
-   - If HEAD returns 301/302 to a login/SSO URL (heuristic: destination URL contains
-     "login", "sso", "auth", "signin", "access" as substrings) → paywalled,
-     set pdf_url = None, is_open_access = False.
-   - If HEAD returns 200 with non-PDF Content-Type → set pdf_url = None.
-   - If HEAD returns 401 or 403 → paywalled, set pdf_url = None.
-   - On any network error → set pdf_url = None (treat as unavailable).
-
-6. Return ScrapeResult with all collected fields.
-   If doi was found, the caller will subsequently call resolve_metadata(doi) via Crossref
-   to get authoritative metadata; the metadata field on ScrapeResult is only used as a
-   fallback if Crossref returns nothing.
-```
-
-### `classify_url(url: str) -> str`
-
-```
-1. Send HEAD request to url (timeout 10s, follow 3 redirects).
-2. If Content-Type header starts with "application/pdf" → return "pdf".
-3. If url ends with ".pdf" (case-insensitive) → return "pdf".
-4. Otherwise → return "landing_page".
-5. On network error → return "landing_page" (safer default; GET will attempt scrape).
-```
-
-### Publisher coverage notes for Claude Code
-
-The Highwire Press tag set covers virtually all major academic publishers without any
-site-specific logic. Confirmed to use `citation_pdf_url`:
-- Springer / SpringerLink
-- Nature Publishing Group
-- Elsevier / ScienceDirect (uses Highwire tags but may gate the PDF URL itself)
-- Wiley Online Library
-- Oxford University Press
-- Cambridge University Press
-- PLOS (always OA, `citation_pdf_url` always resolves)
-- PubMed Central (always OA)
-- arXiv (uses `citation_pdf_url` pointing to /pdf/ route)
-- bioRxiv / medRxiv (preprint servers, always OA)
-- American Chemical Society
-- Royal Society of Chemistry
-- IEEE Xplore (uses Highwire tags; PDF access depends on subscription)
-
-No site-specific translators are needed for v1. The generic Highwire + Dublin Core +
-JSON-LD pipeline covers >95% of academic URLs a researcher would submit.
-
-Implemented in `core/downloader.py`.
-
-```
-Input: doi (str), user_email (str)
-
-1. GET https://api.unpaywall.org/v2/{doi}?email={user_email}
-2. On 200: parse JSON.
-   - Check response['best_oa_location'] is not None.
-   - Get url = response['best_oa_location']['url_for_pdf']
-   - If url is None: try response['best_oa_location']['url'] as fallback (some
-     locations serve the PDF at the landing URL with content negotiation).
-3. If no OA PDF URL exists: return DownloadResult(success=False, reason="no_oa_pdf").
-   DO NOT add the paper to the library.
-4. Download PDF: GET {url} with httpx, stream=True, timeout=30s.
-   Verify Content-Type header starts with "application/pdf".
-   If Content-Type check fails: return DownloadResult(success=False, reason="not_pdf").
-5. Save to a temporary path under the library root: tmp/{doi_sanitised}.pdf
-   (sanitise DOI for filesystem: replace / with _ and strip other illegal chars).
-6. Return DownloadResult(success=True, tmp_path=Path(...)).
-7. Caller then runs DOI extraction pipeline on the downloaded file to confirm
-   metadata and determine final organised path, then calls organiser.place_file().
-```
+`classify_url(url)`: HEAD → `"pdf"` if `application/pdf` or URL ends `.pdf`; else `"landing_page"`. Network error → `"landing_page"`.
 
 ---
 
-## File Organisation
+## Unpaywall Downloader (`core/downloader.py`)
 
-Implemented in `core/organiser.py`.
-
-### Naming Pattern
-
-User-configurable in settings. Default:
-
-```
-{journal}/{year}/{author} ({year}) {title}.pdf
-```
-
-Token names as implemented in `core/organiser.py` and `ui/settings_dialog.py`:
-- `{journal}` = journal name with filesystem-illegal chars removed: `/:*?"<>|` → `_`.
-  If journal is empty: literal `Unsorted`.
-- `{year}` = integer year. If None: `Unknown`.
-- `{author}` = first author's family name. If >2 authors: `{family} et al.`.
-  If no authors: `Unknown`.
-- `{title}` = title truncated to 80 characters, filesystem-safe.
-
-### Placement (`place_file(source: Path, paper: Paper) -> Path`)
-
-```
-1. Compute destination path from naming pattern + paper metadata.
-2. Create all intermediate directories (exist_ok=True).
-3. If source is a temporary download: move (shutil.move).
-   If source is a user-dropped existing PDF: copy (shutil.copy2); original is not deleted.
-4. If destination already exists (duplicate import): append _2, _3, etc. to filename
-   before extension until a free name is found. Log a warning.
-5. Update paper.file_path to the final destination path and save to DB.
-6. Return final Path.
-```
+GET `https://api.unpaywall.org/v2/{doi}?email={user_email}`. Uses `best_oa_location.url_for_pdf`; falls back to `best_oa_location.url`. No OA PDF → `DownloadResult(success=False, reason="no_oa_pdf")` — do NOT add to library. Saves to `{library_root}/tmp/{doi_sanitised}.pdf` (replace `/` with `_`, strip illegal chars).
 
 ---
 
-## Batch Import Orchestration
+## File Organisation (`core/organiser.py`)
 
-Implemented in `core/importer.py` as `ImportWorker(QThread)`.
+Default pattern: `{journal}/{year}/{author} ({year}) {title}.pdf`
 
-### Three input modes
+Token rules: `{journal}` (illegal chars `/:*?"<>|` → `_`; empty → `Unsorted`), `{year}` (None → `Unknown`), `{author}` (first family name; >2 authors → `et al.`; empty → `Unknown`), `{title}` (truncated 80 chars, filesystem-safe).
 
-**Mode 1: Drop PDFs** (list of local Paths)
-```
-For each path:
-  1. Check if file_path already exists in DB — skip if so (duplicate).
-  2. extract_doi_from_pdf(path)
-  3. If DOI found: resolve_metadata(doi) -> paper
-  4. Else: guess_metadata_from_text(path) -> paper
-  5. place_file(path, paper)  [copy, not move]
-  6. Insert paper into DB.
-  7. indexer.add_document(paper, extract_fulltext(path))
-  8. Emit signal: ItemImported(path.name, success, paper.needs_review)
-```
+Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land in `Unsorted/`.
 
-**Mode 2: Paste DOIs** (list of DOI strings)
-```
-For each doi:
-  1. Check if doi already exists in DB — skip if so.
-  2. downloader.download(doi) -> result
-  3. If result.success is False: emit ItemFailed(doi, result.reason); continue.
-  4. resolve_metadata(doi) -> paper
-  5. place_file(result.tmp_path, paper)  [move]
-  6. Insert paper into DB.
-  7. indexer.add_document(paper, extract_fulltext(paper.file_path))
-  8. Emit signal: ItemImported(doi, success=True, needs_review=paper.needs_review)
-```
+`place_file`: copies user-dropped PDFs (original kept), moves tmp downloads. Duplicate destination → appends `_2`, `_3`, etc. Updates `paper.file_path` in-place; read it immediately after the call.
 
-**Mode 3: Paste URLs** (list of URL strings)
+`DEFAULT_PATTERN` exported from `organiser.py` as the canonical fallback.
 
-URLs may point to either a direct PDF file or a publisher/repository landing page.
-The pipeline must distinguish these two cases and handle both.
+---
 
-```
-For each url:
-  1. Classify URL type: call scraper.classify_url(url) -> "pdf" | "landing_page"
-     Classification: send a HEAD request; if Content-Type = application/pdf → "pdf".
-     If HEAD returns non-PDF content type or fails → "landing_page".
+## Batch Import (`core/importer.py` — `ImportWorker(QThread)`)
 
-  2a. If "pdf":
-      Download directly via httpx, verify Content-Type on GET.
-      Save to tmp path.
-      extract_doi_from_pdf(tmp_path) → doi
-      If doi already in DB: unlink tmp file, skip (duplicate).
-      If doi: resolve_metadata(doi) → paper
-      Else: guess_metadata_from_text(tmp_path) → paper
-      paper.open_access = False (we don't know, assume not)
-      place_file, insert, index — same as Mode 2.
+**Mode 1 (drop PDFs):** Check `file_path` duplicate → extract DOI → Crossref resolve or guess metadata → copy → insert DB → index.
 
-  2b. If "landing_page":
-      Call scraper.scrape_landing_page(url) → ScrapeResult
-      (see scraper module below for full pipeline)
-      If ScrapeResult.doi already in DB: skip immediately (duplicate, no download needed).
+**Mode 2 (paste DOIs):** Check DOI duplicate → Unpaywall download → resolve Crossref → move → insert → index.
 
-      If ScrapeResult.pdf_url is not None:
-        Attempt download of ScrapeResult.pdf_url (GET, verify Content-Type).
-        If download succeeds:
-          Save to tmp; doi = ScrapeResult.doi or extract_doi_from_pdf(tmp).
-          If doi already in DB: unlink tmp file, skip (duplicate — covers case where
-          scrape.doi was None but PDF body contained a DOI).
-          resolve_metadata(doi) if doi present, else use ScrapeResult.metadata as paper fields.
-          paper.open_access = ScrapeResult.is_open_access
-          place_file, insert, index.
-        If download fails (redirect to login, non-PDF response, 401/403):
-          → paper is paywalled. Fall through to Unpaywall check.
+**Mode 3 (paste URLs):** `classify_url` → if `"pdf"`: download directly, extract DOI post-download. If `"landing_page"`: scrape → check DOI duplicate → attempt `pdf_url` download → fallback Unpaywall → `ItemFailed` if nothing works.
 
-      If ScrapeResult.pdf_url is None OR direct download failed:
-        If ScrapeResult.doi is not None:
-          Try downloader.download(ScrapeResult.doi) via Unpaywall.
-          If Unpaywall succeeds: place_file, insert, index. paper.open_access = True.
-          If Unpaywall also fails:
-            Emit ItemFailed(url, "no_oa_pdf"). Do NOT add any record to the library.
-        If ScrapeResult.doi is None and ScrapeResult.pdf_url is None:
-          Emit ItemFailed(url, "no_doi_no_pdf"). Do not add to library.
-```
+**Duplicate detection:** All modes check DOI in DB. URL mode: if DOI found in PDF body post-download and already in DB, unlink tmp and skip.
 
-### Rate limiting
+**Rate limiting:** Crossref min 20ms (`RateLimiter` with `asyncio.Lock`). Unpaywall min 100ms.
 
-Crossref polite pool: enforce a minimum 20ms delay between requests (50 req/s).
-Implement as a `RateLimiter` class with a `asyncio.Lock` and timestamp tracking.
-Unpaywall: no stated rate limit, but apply a 100ms minimum delay as courtesy.
+**Resume state:** Progress persisted to `{library_root}/import_state.json` every 100 papers. UI shows total/processed/succeeded/needs\_review/failed and running ETA. User can pause/resume at any time; app remains fully usable during import.
 
-### First-run import of existing 130k flat dump
+---
 
-This is a special case of Mode 1 applied to every PDF found recursively under the user's
-existing library path. Expected duration: 2–6 hours depending on network and Crossref response
-times. Requirements:
-- The worker persists its progress to a `import_state.json` file after every 100 papers.
-- On restart, it reads `import_state.json` and skips already-processed files.
-- The UI shows: total / processed / succeeded / needs_review / failed counts, plus a
-  running ETA based on average processing time per paper.
-- User can pause (worker finishes current item then waits) and resume at any time.
-- The application is fully usable during import (search, browse, edit) for papers
-  already processed.
+## Auto-Categorisation (`core/categoriser.py`)
+
+- `EmbeddingCategoriser`: owned by `MainWindow`, shared (with `threading.Lock`) to `ImportDialog` and `CategorizationDialog`.
+- `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and categories non-empty.
+- `categorise_paper()` returns `(collection_ids, tags)` to **merge onto** the paper, never replace. Creates missing top-level collections automatically.
+- Model: `all-MiniLM-L6-v2` (~23 MB, cached in `~/.cache/torch/sentence_transformers/`). Do NOT switch to Qwen3-Embedding-0.6B (27× slower on CPU). Quality upgrade path: `BAAI/bge-small-en-v1.5`.
+- Retroactive batch: `CategorizationWorker(QThread)`, state in `{library_root}/categorisation_state.json`.
+- `core/llm.py` is dead code — do not import it.
 
 ---
 
 ## UI Layout
-
-### Main Window (three-panel splitter)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -582,118 +298,71 @@ times. Requirements:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Paper Detail Panel — metadata editing rules
-
-- Every field is a `QLineEdit` (single-line) or `QPlainTextEdit` (abstract).
-- Authors: `QLineEdit`, comma-separated display. On save, split by `,` alternating between
-  family and given — store as JSON array. No autocomplete. No lookup table.
-- Tags: displayed as clickable chips; `QLineEdit` below to add new tags; click chip to remove.
-- Changes are saved on `editingFinished` signal (focus-out or Enter). The save is a single
-  `UPDATE papers SET {field}=? WHERE id=?`. No debounce, no secondary queries, no latency.
-- "Needs Review" badge shown prominently if `needs_review = 1`. User dismisses it manually
-  after correcting metadata.
-
-### Search Panel
-
-- Query sent to `indexer.search()` on every `returnPressed` or search button click.
-- Filter controls (applied as post-filter in SQLite on result paper_ids):
-  - Year range: two `QSpinBox` widgets
-  - Journal: `QLineEdit` with `LIKE` filter
-  - Tags: `QListWidget` (multi-select checkboxes)
-  - Collection: selecting a collection node in the left panel filters results to that collection
-  - "Needs Review only" checkbox
-- Results sorted by Tantivy BM25 score by default; user can re-sort by year/title/journal/score via
-  column headers. Score column shows 0–100 normalised against the top hit; blank when no query is active.
-
-### Import Dialog
-
-- Tab 1: Drop PDFs — `QListWidget` showing queued files; drag-drop target; progress column per item.
-- Tab 2: Paste DOIs — `QPlainTextEdit` for pasting; one DOI per line; start button.
-- Tab 3: Paste URLs — same structure as Tab 2.
-- All tabs share a progress section: progress bar, counts (queued/done/failed), live log of
-  last 20 operations.
-- Dialog is non-modal: user can close it and monitor progress in the status bar.
-
----
-
-## Collection and Tag Management
-
-### Collections
-
-- Hierarchical tree, unlimited depth, stored via `parent_id` self-reference in `collections` table.
-- Right-click context menu on tree: New Collection, New Sub-collection, Rename, Delete.
-- Deleting a collection does NOT delete papers — it removes the collection_id from all
-  affected `papers.collection_ids` arrays.
-- A paper appears in a collection if its `collection_ids` JSON array contains that collection's id.
-  It also implicitly appears in all ancestor collections (handled in the tree view filter query).
-- Multi-collection membership is supported; a paper can be in any number of collections.
-
-### Tags
-
-- Free-text strings stored in `papers.tags` JSON array.
-- Tag list in left panel shows all unique tags across all papers (derived by a DB query on startup
-  and updated incrementally).
-- Clicking a tag filters the results panel to papers containing that tag.
-
-### Auto-Categorisation (`core/categoriser.py`)
-
-- `EmbeddingCategoriser`: owned by `MainWindow`, passed to `ImportDialog` and `CategorizationDialog`.
-  Uses `threading.Lock` around all inference calls — safe to share across concurrent QThreads.
-- `load_model()` is blocking; always call from a worker thread or a daemon `threading.Thread`.
-  `MainWindow` preloads silently at startup if `auto_categorise=True` and categories are non-empty.
-- `categorise_paper()` returns `(collection_ids, tags)` to merge (never replace) onto the paper.
-  It creates missing top-level collections in the DB automatically by name.
-- `CategorizationWorker(QThread)`: retroactive batch; persists state to
-  `{library_root}/categorisation_state.json` (alongside `import_state.json`).
-- `core/llm.py` is a thin adapter over `EmbeddingCategoriser` kept for interface compatibility;
-  it is not imported anywhere in the app — do not treat it as the primary entry point.
-- Embedding model: `all-MiniLM-L6-v2` (~23 MB). Cached in `~/.cache/torch/sentence_transformers/`
-  after first download. Do NOT switch to Qwen3-Embedding-0.6B (0.6B params ≈ 27× slower on CPU).
-  `BAAI/bge-small-en-v1.5` is the quality upgrade path that remains CPU-feasible.
-
----
-
-## Error Handling Conventions
-
-- All network calls (`httpx`) wrapped in `try/except httpx.HTTPError`. On failure: log error,
-  mark paper `needs_review = True`, continue processing.
-- All PDF operations (`fitz.open`) wrapped in `try/except`. Corrupt or password-protected PDFs
-  are logged and skipped; user sees them in the import summary as "failed".
-- SQLite errors: fatal (raise, show error dialog, do not silently corrupt data).
-- Worker threads communicate with the UI exclusively via Qt signals. Never call UI methods
-  directly from a worker thread.
+- Authors field: comma-separated display, split on save into JSON array. No autocomplete, no lookup table.
+- Tags: clickable chips, removed by clicking; `QLineEdit` below to add.
+- Changes saved on `editingFinished` (focus-out or Enter) — single `UPDATE`, no debounce.
+- Deleting a collection removes its ID from all `papers.collection_ids` arrays; does not delete papers.
 
 ---
 
 ## Code Style
 
-- Python 3.12 exactly (`py -3.12`). Type hints on all function signatures.
-- `pathlib.Path` throughout. No `os.path` usage.
-- `dataclasses` for all data transfer objects.
-- No ORM. All SQL written as explicit parameterised query strings in `core/db.py`.
-- No global mutable state. All major objects (DB connection, indexer, settings) passed via
-  constructor injection.
-- Qt signals defined as class attributes using `pyqtSignal`.
-- `asyncio` for all HTTP I/O. Worker threads use `asyncio.run()` internally for the HTTP layer.
-- Imports: stdlib → third-party → local, separated by blank lines.
-- Line length: 100 chars max.
+- Python 3.12 (`py -3.12`). Type hints on all signatures.
+- `pathlib.Path` throughout; no `os.path`.
+- `dataclasses` for all DTOs. No ORM.
+- All SQL as parameterised strings in `core/db.py`.
+- No global mutable state; constructor injection for DB, indexer, settings.
+- Qt signals as class attributes with `pyqtSignal`.
+- `asyncio` for all HTTP. `ImportWorker` creates its own `asyncio.new_event_loop()` — not connected to the qasync main loop.
+- `asyncio.ensure_future(coro)` from synchronous Qt slots works via qasync. Do NOT use QThread for async HTTP — QThread is for CPU-bound/blocking work only.
+- Imports: stdlib → third-party → local, blank-line separated. 100-char line limit.
 
 ---
 
-## Explicit Non-Requirements (do not build)
+## Error Handling
 
-- No web server, browser extension, or network-facing interface of any kind.
-- No BibTeX, RIS, or citation export.
-- No built-in PDF viewer (use `os.startfile(path)` to open in system default application).
-- No cloud sync or remote library.
-- No Sci-Hub or any download source other than Unpaywall.
-- No normalised author, journal, keyword, or any other lookup table in SQLite.
-- No citation graph, reference parsing, or related-paper discovery.
-- No Linux or macOS support.
+- Network (`httpx`): catch `httpx.HTTPError`, log, set `needs_review=True`, continue.
+- PDF (`fitz.open`): catch all exceptions, log, skip item, report as "failed" in import summary.
+- SQLite: fatal — raise, show error dialog, never silently corrupt.
+- Worker → UI: Qt signals only.
 
 ---
 
-## Dependencies (pyproject.toml)
+## PyQt6 Gotchas
+
+- `QFlowLayout` doesn't exist. Tag chips use `QHBoxLayout(AlignLeft)`.
+- Drag from `QTableView`: must implement `flags()` (+`ItemIsDragEnabled`), `mimeTypes()`, `mimeData()` on the model. `setDragEnabled(True)` alone does nothing.
+- Drop onto `QTreeView`: subclass + override `dragEnterEvent`/`dragMoveEvent`/`dropEvent`. Use `event.position().toPoint()` (not `event.pos()`).
+- MIME type for drag-drop: `application/x-paperbase-paper-ids` (comma-separated IDs, UTF-8).
+
+---
+
+## Implementation Gotchas
+
+**PaperTableModel columns** (`ui/search_panel.py`): adding a column requires `_COLUMNS`, `data()`, and `sort()`. Scores live in `_scores: dict[int, float]` on the model, not on `Paper`.
+
+**Async unbound local:** Always initialise `paper = None` before `if doi: paper = await resolve_metadata(...)`. Python raises `UnboundLocalError` on the fallback if `doi` was falsy and the branch never executed.
+
+**Settings field — 5 places:** `Settings.__init__` (default), `.save`, `.load`, `SettingsDialog._build_ui`, `SettingsDialog._accept`. If consumed by `ImportWorker`: also `ImportWorker.__init__` and `ImportDialog._start_import`.
+
+**`place_file` call sites:** Exactly 5 in `importer.py` (`_import_pdf`, `_import_doi`, `_import_direct_pdf_url`, two in `_import_landing_page`). Post-placement hooks and `_apply_categorisation` must be added at all 5. `_apply_categorisation` is called immediately after `paper.id = paper_id` at all 5 `insert_paper` sites.
+
+**Dialog cache invalidation:** `_open_settings` nulls `_import_dialog` and `_cat_dialog` — intentional. Both cache categoriser settings at construction; must be recreated after settings change. Do not add lazy-init guards that skip this reset.
+
+**SQLite variable limit:** Chunk `IN (?,?...)` at ≤900 items (`SQLITE_MAX_VARIABLE_NUMBER` = 999 on older builds). `get_papers_by_ids` already does this; do not add new unbounded IN clauses. `search_filter` takes `paper_ids=None` (no pre-filter, query all) vs `paper_ids=[]` (no results — distinct case).
+
+**Tag/collection filter:** Calls `get_paper(pid)` individually per ID — acceptable for ≤500 Tantivy results, slow for `paper_ids=None` on large result sets. Known limitation; do not "fix" with an unbounded IN clause.
+
+**Windows file actions:**
+- Reveal in Explorer: `subprocess.Popen(["explorer", "/select," + file_path])`
+- Copy to clipboard: `QMimeData.setUrls([QUrl.fromLocalFile(path)])`; apply with `QApplication.clipboard().setMimeData(mime)`
+- Full text retrieval: `fitz.open(path)` — Tantivy `fulltext` is `stored=False`
+
+**Debugging import failures:** Check DB by DOI (not file path) using the debug command above. Crossref legitimately returns `title: []`/`author: []` for some valid DOIs — these set `needs_review=True`; verify at `https://api.crossref.org/works/{doi}`.
+
+---
+
+## Dependencies
 
 ```toml
 [project]
@@ -718,124 +387,4 @@ dependencies = [
 dev = ["pyinstaller>=6.0", "pytest>=8.0", "pytest-qt>=4.4"]
 ```
 
----
-
-## Build / Run
-
-```
-pip install -e .
-python -m paperbase.main   # or: paperbase  (installed console script)
-```
-
-**Tests:** No test suite exists yet. `pytest` and `pytest-qt` are in dev deps as placeholders for future tests.
-
-First-run wizard:
-1. Select library root path (where organised PDFs will be stored).
-2. Select existing PDF folder to import (can be skipped and done later).
-3. Enter email address (used as Crossref polite pool identifier and Unpaywall identifier —
-   never sent anywhere else).
-4. Confirm folder naming pattern (shown with example derived from first found PDF).
-5. Import begins in background. Application opens immediately.
-
----
-
-## Implementation Notes
-
-### Runtime data directory
-All persistent state is stored under `%LOCALAPPDATA%\PaperBase\PaperBase\`:
-- `paperbase.db` — SQLite database
-- `index/` — Tantivy full-text index
-- `settings.json` — library root, user email, folder pattern
-
-First place to look when debugging index corruption or a missing/empty DB.
-`import_state.json` (first-run import resume state) lives at `{library_root}/import_state.json` (alongside the PDFs, not in the app data dir).
-
-### PaperTableModel column extension
-- Adding a column requires touching three places in `ui/search_panel.py`: `_COLUMNS` (drives `columnCount` and `headerData` automatically), `data()` (new `if col == N` branch), and `sort()` (new `elif column == N` branch).
-- Scores are not stored on `Paper`; `PaperTableModel` holds a separate `_scores: dict[int, float]` (paper_id → value) passed into `set_papers()`. Absent entries render as `""`.
-
-### PyQt6 gotchas
-- `QFlowLayout` does not exist in PyQt6. Tag chips in `ui/paper_detail.py` use `QHBoxLayout` with `AlignLeft`.
-- Drag from `QTableView`: must implement `flags()` (add `ItemIsDragEnabled`), `mimeTypes()`, and `mimeData()` on the model — `setDragEnabled(True)` alone does nothing.
-- Drop onto `QTreeView`: subclass the view and override `dragEnterEvent`/`dragMoveEvent`/`dropEvent`. Use `event.position().toPoint()` (not `event.pos()`) to get the drop point in PyQt6.
-- Custom drag-drop MIME type used across the app: `application/x-paperbase-paper-ids` — comma-separated paper IDs encoded as UTF-8 bytes.
-
-### Async pattern in importer
-- Always initialise `paper = None` before a conditional `if doi: paper = await resolve_metadata(...)` block.
-  Python raises `UnboundLocalError` on the `if paper is None:` fallback if `doi` was falsy and the branch never ran.
-- `ImportWorker` (QThread) creates its own `asyncio.new_event_loop()` and is not connected to the `qasync` main-thread loop.
-
-### Async from main-thread Qt slots
-- `asyncio.ensure_future(coro)` works directly from synchronous Qt slots (e.g. button `clicked`).
-  qasync installs its loop as the running loop on the main thread, so coroutines resume there and
-  can safely update UI. Do NOT use QThread for this — QThread is only for CPU-bound or blocking work.
-
-### SQLite schema migrations
-- Adding new columns to an existing DB: call `ALTER TABLE papers ADD COLUMN ...` wrapped in
-  `try/except sqlite3.OperationalError` inside a `_migrate()` method called from `Database.open()`.
-  SQLite has no `IF NOT EXISTS` clause for `ALTER TABLE`.
-
-### Extending the Paper dataclass
-- New fields must be keyword arguments with defaults (e.g. `isbn: Optional[str] = None`) so that
-  existing `Paper(...)` construction sites that omit them (scraper, metadata, tests) keep working.
-  Required positional fields cannot be added after optional ones in a dataclass.
-
-### Book metadata
-- `journal` field stores publisher name when `document_type == "book"`. UI label reads "Journal/Publisher".
-- Book lookup order: Open Library (`https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data`)
-  then Google Books (`https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}`). Both are free, no API key.
-- Import pipeline: DOI → (no result) → ISBN → `resolve_book_metadata` → `guess_metadata_from_text`.
-
-### Folder naming pattern data flow
-- `Settings.folder_pattern` (settings_dialog.py) → passed to `ImportDialog.__init__` → passed to
-  `ImportWorker(folder_pattern=...)` → passed to every `place_file(..., folder_pattern=...)` call
-  → forwarded to `compute_destination(paper, library_root, pattern)` in organiser.py.
-- `DEFAULT_PATTERN` is exported from `organiser.py` as the canonical fallback.
-- Papers with `metadata_source in ("xmp", "filename")` bypass the pattern entirely and land in `Unsorted/`.
-
-### Adding a new Settings field
-- Touch 5 places: `Settings.__init__` (default), `Settings.save` (key), `Settings.load` (get),
-  `SettingsDialog._build_ui` (widget), `SettingsDialog._accept` (write-back).
-- If the field is consumed by `ImportWorker`, also add it to `ImportWorker.__init__` and pass it
-  from `ImportDialog._start_import` (which reads from `self._settings` at start time).
-
-### `place_file` call sites in importer.py
-- Exactly 5 sites across 3 methods: `_import_pdf`, `_import_doi`, `_import_direct_pdf_url`,
-  and two in `_import_landing_page` (scrape-direct path and Unpaywall path).
-- Any post-placement hook (e.g. secondary copy) must be added after all 5. `paper.file_path` is
-  updated in-place by `place_file`, so read it immediately after the call.
-- `_apply_categorisation(paper)` follows the same pattern: called at all 5 `insert_paper` sites,
-  immediately after `paper.id = paper_id`. Add any future post-insert hook at all 5 sites.
-
-### Dialog cache invalidation in MainWindow
-- `_open_settings` sets `_import_dialog = None` and `_cat_dialog = None` after saving.
-  This is intentional: both dialogs cache `categoriser` settings at construction time, so
-  they must be recreated after settings change. Do not add lazy-init guards that skip this reset.
-
-### Windows file actions
-- Reveal in Explorer with file selected: `subprocess.Popen(["explorer", "/select," + file_path])`
-- Copy file to clipboard (paste-into-Explorer): `QMimeData.setUrls([QUrl.fromLocalFile(path)])`; apply via `QApplication.clipboard().setMimeData(mime)`
-- Full text retrieval: use `fitz.open(path)` — the Tantivy `fulltext` field is `stored=False` so the index cannot return original text, only match against it
-
-### Smoke-testing without a test suite
-- `py -3.12 -c "from paperbase.xxx import yyy; print('OK')"` is the fastest correctness check.
-  Run after any change that touches imports or dataclass fields.
-
-### Debugging import failures
-- Check the DB directly first: `py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"`
-- Crossref legitimately returns `title: []` and `author: []` for some valid DOIs (e.g. 10.3752/cjai.2010.09). These now set `needs_review=True` automatically. If a paper imports with blank title despite `metadata_source='crossref'`, the Crossref record itself is incomplete — verify with a direct GET to `https://api.crossref.org/works/{doi}`.
-- DOI-duplicate skip: applies to all three import modes. URL modes download before the DOI is known; if a duplicate is detected post-download, the tmp file is unlinked before returning. If a file "won't import", check by querying the DB for the DOI rather than the file path.
-
-### SQLite variable limit
-- `SQLITE_MAX_VARIABLE_NUMBER` is 999 on older SQLite builds. Any `IN (?,?...)` clause must be
-  chunked at ≤900 items. `get_papers_by_ids` already does this. Do not add new unbounded IN
-  clauses against the full papers table.
-- `search_filter` accepts `paper_ids=None` as a sentinel meaning "no Tantivy pre-filter; query
-  all papers". This avoids building a 134k-item IN clause for the no-query browse case.
-  `paper_ids=[]` (empty list) is a distinct case meaning "no results".
-
-### Tag/collection filter performance
-- The tag and collection filter branches in `search_filter` call `get_paper(pid)` individually
-  per matching ID. This is acceptable for Tantivy results (≤500 IDs) but will be slow if
-  activated with `paper_ids=None` and a large result set. Known limitation; do not "fix" by
-  loading all IDs into an IN clause.
+No test suite exists yet. `pytest`/`pytest-qt` are dev placeholders.
