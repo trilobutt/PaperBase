@@ -38,7 +38,8 @@ class Indexer:
         except Exception:
             # Index may not exist yet — create it
             self._index = tantivy.Index(self._schema, str(self._index_dir), reuse=False)
-        self._writer = self._index.writer(heap_size=128 * 1024 * 1024)
+        # Writer is created lazily on first write to avoid the 128 MB heap
+        # allocation and Rust thread startup on every app launch.
 
     def close(self) -> None:
         if self._writer:
@@ -53,8 +54,14 @@ class Indexer:
         if self._index is None:
             self.open()
 
+    def _ensure_writer(self) -> None:
+        if self._writer is None:
+            assert self._index is not None
+            self._writer = self._index.writer(heap_size=128 * 1024 * 1024)
+
     def add_document(self, paper: Paper, fulltext: str) -> None:
         self._ensure_open()
+        self._ensure_writer()
         assert self._writer is not None
         doc = tantivy.Document()
         doc.add_integer("paper_id", paper.id or 0)
@@ -68,11 +75,13 @@ class Indexer:
         self._writer.add_document(doc)
 
     def commit(self) -> None:
+        self._ensure_writer()
         if self._writer:
             self._writer.commit()
 
     def delete_document(self, paper_id: int) -> None:
         self._ensure_open()
+        self._ensure_writer()
         assert self._writer is not None
         self._writer.delete_documents("paper_id", paper_id)
         self._writer.commit()
@@ -84,6 +93,7 @@ class Indexer:
     ) -> None:
         """Index a batch of papers. Commits at the end."""
         self._ensure_open()
+        self._ensure_writer()
         total = len(papers)
         for i, (paper, fulltext) in enumerate(papers):
             self.add_document(paper, fulltext)

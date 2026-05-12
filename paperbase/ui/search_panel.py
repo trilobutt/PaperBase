@@ -257,18 +257,28 @@ class SearchPanel(QWidget):
         sidebar_tags = [item.text() for item in self._tag_list.selectedItems()]
         combined_tags = list(set(self._active_tags + sidebar_tags)) or None
 
-        filtered_ids = self._db.search_filter(
-            self._last_result_ids,
-            year_from=year_from,
-            year_to=year_to,
-            journal=journal,
-            tags=combined_tags,
-            collection_id=self._active_collection,
-            needs_review_only=needs_review,
-            document_type=document_type,
+        no_filters = (
+            not year_from and not year_to and not journal
+            and not needs_review and not document_type
+            and not combined_tags and self._active_collection is None
         )
+        if self._last_result_ids is None and no_filters:
+            # Fast path: no search query and no filters — single full-table scan
+            # avoids the two-step ID-list → 145 chunked-IN approach.
+            papers = self._db.get_all_papers_slim()
+        else:
+            filtered_ids = self._db.search_filter(
+                self._last_result_ids,
+                year_from=year_from,
+                year_to=year_to,
+                journal=journal,
+                tags=combined_tags,
+                collection_id=self._active_collection,
+                needs_review_only=needs_review,
+                document_type=document_type,
+            )
+            papers = self._db.get_papers_slim_by_ids(filtered_ids)
 
-        papers = self._db.get_papers_by_ids(filtered_ids)
         scores = self._last_scores if self._last_scores else None
         self._model.set_papers(papers, scores)
         count = len(papers)
@@ -280,7 +290,13 @@ class SearchPanel(QWidget):
             os.startfile(paper.file_path)
 
     def _on_row_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
-        paper = self._model.paper_at(current.row())
+        slim = self._model.paper_at(current.row())
+        if slim is None:
+            self.paper_selected.emit(None)
+            return
+        # The listing model holds slim papers (no abstract/keywords); fetch the
+        # full row for the detail panel. PK lookup is <5 ms.
+        paper = self._db.get_paper(slim.id) if slim.id is not None else slim
         self.paper_selected.emit(paper)
 
     def reload_current_paper(self, paper_id: int) -> None:

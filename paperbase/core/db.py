@@ -50,6 +50,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# All columns except abstract and keywords — used for the listing view where
+# neither field is displayed. Avoids loading tens of MB of text on startup.
+_SLIM_COLS = (
+    "id, doi, title, authors, journal, year, volume, issue, pages, "
+    "tags, collection_ids, file_path, date_added, date_modified, "
+    "metadata_source, needs_review, open_access, isbn, document_type"
+)
+
+
 def _paper_from_row(row: sqlite3.Row) -> Paper:
     keys = row.keys()
     return Paper(
@@ -64,6 +73,33 @@ def _paper_from_row(row: sqlite3.Row) -> Paper:
         pages=row["pages"],
         abstract=row["abstract"],
         keywords=json.loads(row["keywords"]),
+        tags=json.loads(row["tags"]),
+        collection_ids=json.loads(row["collection_ids"]),
+        file_path=row["file_path"],
+        date_added=row["date_added"],
+        date_modified=row["date_modified"],
+        metadata_source=row["metadata_source"],
+        needs_review=bool(row["needs_review"]),
+        open_access=bool(row["open_access"]),
+        isbn=row["isbn"] if "isbn" in keys else None,
+        document_type=row["document_type"] if "document_type" in keys else "article",
+    )
+
+
+def _paper_slim_from_row(row: sqlite3.Row) -> Paper:
+    keys = row.keys()
+    return Paper(
+        id=row["id"],
+        doi=row["doi"],
+        title=row["title"],
+        authors=json.loads(row["authors"]),
+        journal=row["journal"],
+        year=row["year"],
+        volume=row["volume"],
+        issue=row["issue"],
+        pages=row["pages"],
+        abstract="",
+        keywords=[],
         tags=json.loads(row["tags"]),
         collection_ids=json.loads(row["collection_ids"]),
         file_path=row["file_path"],
@@ -232,6 +268,34 @@ class Database:
             ).fetchall()
             by_id.update({r["id"]: _paper_from_row(r) for r in rows})
         # preserve order
+        return [by_id[i] for i in ids if i in by_id]
+
+    def get_all_papers_slim(self) -> list[Paper]:
+        """Fetch all papers ordered by date_added DESC, omitting abstract and keywords.
+
+        Used for the listing view on startup and after clearing a search query.
+        A single query is far cheaper than the two-step ID-list → chunked-IN approach.
+        """
+        conn = self._conn_required()
+        rows = conn.execute(
+            f"SELECT {_SLIM_COLS} FROM papers ORDER BY date_added DESC"
+        ).fetchall()
+        return [_paper_slim_from_row(r) for r in rows]
+
+    def get_papers_slim_by_ids(self, ids: list[int]) -> list[Paper]:
+        """Like get_papers_by_ids but omits abstract and keywords for fast listing."""
+        if not ids:
+            return []
+        conn = self._conn_required()
+        by_id: dict[int, Paper] = {}
+        chunk_size = 900
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT {_SLIM_COLS} FROM papers WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+            by_id.update({r["id"]: _paper_slim_from_row(r) for r in rows})
         return [by_id[i] for i in ids if i in by_id]
 
     def delete_paper(self, paper_id: int) -> None:
