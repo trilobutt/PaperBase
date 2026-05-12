@@ -2,12 +2,13 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QMimeData, Qt, QUrl, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -170,6 +171,22 @@ class PaperDetail(QWidget):
         self._open_btn = QPushButton("Open PDF")
         self._open_btn.clicked.connect(self._open_pdf)
         self._form_layout.addWidget(self._open_btn)
+
+        # File action buttons
+        file_row = QHBoxLayout()
+        self._copy_pdf_btn = QPushButton("Copy PDF")
+        self._copy_pdf_btn.setToolTip("Copy PDF file to clipboard (paste into Explorer)")
+        self._copy_pdf_btn.clicked.connect(self._copy_pdf)
+        self._copy_text_btn = QPushButton("Copy text")
+        self._copy_text_btn.setToolTip("Copy full extracted text to clipboard")
+        self._copy_text_btn.clicked.connect(self._copy_full_text)
+        self._open_folder_btn = QPushButton("Open folder")
+        self._open_folder_btn.setToolTip("Open containing folder with file selected")
+        self._open_folder_btn.clicked.connect(self._open_folder)
+        file_row.addWidget(self._copy_pdf_btn)
+        file_row.addWidget(self._copy_text_btn)
+        file_row.addWidget(self._open_folder_btn)
+        self._form_layout.addLayout(file_row)
         self._form_layout.addStretch()
 
         self._set_enabled(False)
@@ -183,7 +200,8 @@ class PaperDetail(QWidget):
                   self._year_spin, self._doi_edit, self._doi_lookup_btn,
                   self._isbn_edit, self._isbn_lookup_btn,
                   self._volume_edit, self._issue_edit, self._pages_edit,
-                  self._abstract_edit, self._tag_input, self._open_btn):
+                  self._abstract_edit, self._tag_input, self._open_btn,
+                  self._copy_pdf_btn, self._copy_text_btn, self._open_folder_btn):
             w.setEnabled(enabled)
 
     def show_paper(self, paper: Paper) -> None:
@@ -289,6 +307,30 @@ class PaperDetail(QWidget):
     def _open_pdf(self) -> None:
         if self._paper and self._paper.file_path:
             os.startfile(self._paper.file_path)  # type: ignore[attr-defined]
+
+    def _copy_pdf(self) -> None:
+        if not self._paper or not self._paper.file_path:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(self._paper.file_path)])
+        QApplication.clipboard().setMimeData(mime)
+
+    def _copy_full_text(self) -> None:
+        if not self._paper or not self._paper.file_path:
+            return
+        try:
+            import fitz
+            doc = fitz.open(self._paper.file_path)
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            QApplication.clipboard().setText(text)
+        except Exception as e:
+            logger.error("Failed to extract full text from %s: %s", self._paper.file_path, e)
+
+    def _open_folder(self) -> None:
+        if not self._paper or not self._paper.file_path:
+            return
+        subprocess.Popen(["explorer", "/select," + self._paper.file_path])
 
     # ------------------------------------------------------------------
     # Metadata lookup

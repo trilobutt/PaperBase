@@ -807,6 +807,11 @@ First place to look when debugging index corruption or a missing/empty DB.
 - Any post-placement hook (e.g. secondary copy) must be added after all 5. `paper.file_path` is
   updated in-place by `place_file`, so read it immediately after the call.
 
+### Windows file actions
+- Reveal in Explorer with file selected: `subprocess.Popen(["explorer", "/select," + file_path])`
+- Copy file to clipboard (paste-into-Explorer): `QMimeData.setUrls([QUrl.fromLocalFile(path)])`; apply via `QApplication.clipboard().setMimeData(mime)`
+- Full text retrieval: use `fitz.open(path)` — the Tantivy `fulltext` field is `stored=False` so the index cannot return original text, only match against it
+
 ### Smoke-testing without a test suite
 - `py -3.12 -c "from paperbase.xxx import yyy; print('OK')"` is the fastest correctness check.
   Run after any change that touches imports or dataclass fields.

@@ -1,10 +1,11 @@
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QAbstractTableModel, QByteArray, QMimeData, QModelIndex, pyqtSignal
+from PyQt6.QtCore import Qt, QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QUrl, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QSpinBox,
     QTableView, QVBoxLayout, QWidget,
 )
@@ -298,14 +299,42 @@ class SearchPanel(QWidget):
             return
 
         menu = QMenu(self)
+        act_open_folder = menu.addAction("Open containing folder")
+        act_copy_file   = menu.addAction("Copy PDF file")
+        act_copy_text   = menu.addAction("Copy full text")
+        menu.addSeparator()
         act_library = menu.addAction("Remove from library")
         act_disk    = menu.addAction("Delete from library and disk")
         chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
 
-        if chosen == act_library:
+        if chosen == act_open_folder:
+            self._open_containing_folder(paper.file_path)
+        elif chosen == act_copy_file:
+            self._copy_pdf_file(paper.file_path)
+        elif chosen == act_copy_text:
+            self._copy_full_text(paper.file_path)
+        elif chosen == act_library:
             self._delete_paper(paper, delete_file=False)
         elif chosen == act_disk:
             self._delete_paper(paper, delete_file=True)
+
+    def _open_containing_folder(self, file_path: str) -> None:
+        subprocess.Popen(["explorer", "/select," + file_path])
+
+    def _copy_pdf_file(self, file_path: str) -> None:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(file_path)])
+        QApplication.clipboard().setMimeData(mime)
+
+    def _copy_full_text(self, file_path: str) -> None:
+        try:
+            import fitz
+            doc = fitz.open(file_path)
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            QApplication.clipboard().setText(text)
+        except Exception as e:
+            logger.error("Failed to extract full text from %s: %s", file_path, e)
 
     def _delete_paper(self, paper, *, delete_file: bool) -> None:
         title_snippet = (paper.title or paper.file_path)[:80]
