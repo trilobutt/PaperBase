@@ -187,9 +187,13 @@ Index fields: `paper_id` (stored, indexed int), `title` (stored text), `abstract
 
 `fulltext` is not stored; only `title` is available from the index. All other display metadata fetched from SQLite by `paper_id`.
 
-Query syntax: `"exact phrase"`, `field:term` (fields: title, abstract, authors, keywords, fulltext), `AND`/`OR`/`NOT`, `+required -excluded`, `year:[2020 TO 2023]`, `word*`. Invalid syntax falls back to whole-input phrase search.
+Query syntax: `"exact phrase"`, `field:term` (fields: title, abstract, authors, keywords, fulltext), `AND`/`OR`/`NOT`, `+required -excluded`, `year:[2020 TO 2023]`, `word*`/`*word`/`wo*rd`. Invalid syntax falls back to whole-input phrase search.
 
 Results uncapped (`searcher.num_docs` as limit). Scores normalised 0–100 against top hit; blank column when no query is active.
+
+**Wildcards (`*`):** Tantivy's `parse_query` has no native wildcard support — it silently drops `*` from terms. Any query containing `*` is instead routed through `Indexer._parse_wildcard_query`/`_build_clause_query` (`core/indexer.py`), which tokenises the string (respecting quoted phrases and `field:[range]` tokens), converts each `*`-containing clause to an anchored regex via `tantivy.Query.regex_query`, and recombines clauses with `tantivy.Query.boolean_query` using the same `AND`/`OR`/`NOT`/`+`/`-` semantics. Queries without `*` are unaffected — they still go straight through `parse_query`.
+
+All text fields use the `en_stem` tokenizer, so `regex_query` matches against **stemmed, lowercased** terms, not the raw word. Trailing wildcards (`word*`) are reliable since stemming only ever removes a suffix — a literal prefix always still matches. Leading/infix wildcards (`*word`, `wo*rd`) are correctly implemented but can miss matches where the wildcard's fixed text spans a suffix the stemmer would otherwise strip (e.g. `*genesis` won't match "biogenesis", because `en_stem` indexes it as `biogenesi`). This is a property of the stemmed index, not a parser bug — do not try to "fix" it by switching tokenizers.
 
 ---
 

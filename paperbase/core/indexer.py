@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -10,6 +11,17 @@ from paperbase.models.search_result import SearchResult
 logger = logging.getLogger(__name__)
 
 SNIPPET_MAX_CHARS = 300
+
+# Splits a query into clauses: quoted phrases, "field:[range]" tokens, or bare
+# whitespace-separated words — mirrors what Tantivy's own parser treats as one unit.
+_QUERY_TOKEN_RE = re.compile(r'"[^"]*"|\S+:\[[^\]]*\]|\S+:\{[^}]*\}|\S+')
+_FIELD_PREFIX_RE = re.compile(r"^([A-Za-z_]\w*):(.+)$")
+
+
+def _glob_to_regex(pattern: str) -> str:
+    # regex_query matches the full, lowercased indexed term — not a substring —
+    # so no anchors are needed, just escape the literal runs around each '*'.
+    return ".*".join(re.escape(part) for part in pattern.lower().split("*"))
 
 
 def _build_schema() -> tantivy.Schema:
@@ -113,7 +125,10 @@ class Indexer:
 
         default_fields = ["title", "abstract", "authors", "keywords", "fulltext"]
         try:
-            query = self._index.parse_query(query_str, default_fields)
+            if "*" in query_str:
+                query = self._parse_wildcard_query(query_str, default_fields)
+            else:
+                query = self._index.parse_query(query_str, default_fields)
         except Exception:
             escaped = query_str.replace('"', '\\"')
             try:
@@ -146,6 +161,69 @@ class Indexer:
                 )
             )
         return results
+
+    def _parse_wildcard_query(self, query_str: str, default_fields: list[str]) -> tantivy.Query:
+        """Build a query for strings containing '*', which Tantivy's parser can't handle natively."""
+        clauses: list[tuple[tantivy.Occur, tantivy.Query]] = []
+        pending_occur = tantivy.Occur.Should
+        for raw in _QUERY_TOKEN_RE.findall(query_str):
+            upper = raw.upper()
+            if upper == "AND":
+                pending_occur = tantivy.Occur.Must
+                continue
+            if upper == "OR":
+                pending_occur = tantivy.Occur.Should
+                continue
+            if upper == "NOT":
+                pending_occur = tantivy.Occur.MustNot
+                continue
+
+            occur, token = pending_occur, raw
+            if token.startswith("+"):
+                occur, token = tantivy.Occur.Must, token[1:]
+            elif token.startswith("-"):
+                occur, token = tantivy.Occur.MustNot, token[1:]
+            pending_occur = tantivy.Occur.Should
+
+            subquery = self._build_clause_query(token, default_fields)
+            if subquery is not None:
+                clauses.append((occur, subquery))
+
+        if not clauses:
+            raise ValueError(f"no usable clauses in query: {query_str!r}")
+        if len(clauses) == 1 and clauses[0][0] != tantivy.Occur.MustNot:
+            return clauses[0][1]
+        return tantivy.Query.boolean_query(clauses)
+
+    def _build_clause_query(
+        self, token: str, default_fields: list[str]
+    ) -> Optional[tantivy.Query]:
+        """Parse one whitespace-separated clause: a plain term/range via Tantivy's parser,
+        or — if it contains '*' — a glob expanded into a regex over the relevant field(s)."""
+        if "*" not in token or token.startswith('"'):
+            try:
+                return self._index.parse_query(token, default_fields)
+            except Exception:
+                logger.warning("Failed to parse query clause %r", token)
+                return None
+
+        match = _FIELD_PREFIX_RE.match(token)
+        if match and match.group(1) in default_fields:
+            fields, pattern = [match.group(1)], match.group(2)
+        else:
+            fields, pattern = default_fields, token
+
+        if not pattern.replace("*", ""):
+            logger.warning("Wildcard-only query clause %r is too broad, skipping", token)
+            return None
+
+        regex = _glob_to_regex(pattern)
+        field_queries = [
+            tantivy.Query.regex_query(self._schema, field, regex) for field in fields
+        ]
+        if len(field_queries) == 1:
+            return field_queries[0]
+        return tantivy.Query.boolean_query([(tantivy.Occur.Should, q) for q in field_queries])
 
     def document_count(self) -> int:
         self._ensure_open()
