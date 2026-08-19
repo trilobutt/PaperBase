@@ -88,7 +88,7 @@ class CollectionTree(QWidget):
         self._tree.papers_dropped.connect(self._on_papers_dropped)
 
         layout.addWidget(self._tree)
-        self.refresh()
+        # Populated by MainWindow.start_deferred_load, after the first paint.
 
     def refresh(self) -> None:
         self._model.clear()

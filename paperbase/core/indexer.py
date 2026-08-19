@@ -122,6 +122,11 @@ class Indexer:
         # Reload searcher so it sees latest committed segments
         self._index.reload()
         searcher = self._index.searcher()
+        # Tantivy's top-score collector asserts its limit is non-zero and panics (a Rust
+        # panic, which takes the process with it) when handed 0. An index with nothing in
+        # it is the ordinary first-run state, so it is answered here rather than reached.
+        if searcher.num_docs == 0:
+            return []
 
         default_fields = ["title", "abstract", "authors", "keywords", "fulltext"]
         try:

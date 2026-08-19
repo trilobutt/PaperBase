@@ -1,424 +1,545 @@
+"""Design tokens and the global Qt stylesheet.
+
+The identity is a deep black canvas with translucent glass panels floating on it as
+islands, one accent hue per region, and light coming from colour rather than grey fill.
+Every colour, radius, spacing step and motion duration in the application is a module
+constant here; widget files reference them by name and never hardcode a hex value.
+
+Structural rules this file depends on:
+
+- ``QWidget`` carries the canvas black as its base. Nothing else paints a solid panel
+  colour globally: a panel colour on the base selector would repaint every anonymous
+  layout container and destroy the floating-island layout.
+- ``.QWidget`` (the dot form matches plain ``QWidget`` instances and not subclasses)
+  is transparent, so the row containers, scroll-area viewports and layout holders that
+  sit inside a glass panel let the panel show through.
+- Panels are styled by object name (``#GlassPanel``), never by class. A panel carrying
+  chrome (the command bar, a dialog header) sets the dynamic property ``chrome`` to
+  ``True`` for the heavier ``PANEL_FILL_HI`` fill.
+- Qt has no ``box-shadow``: panel lift comes from ``QGraphicsDropShadowEffect`` in
+  ``paperbase.ui.glass``, not from here.
+- Qt has no ``prefers-reduced-motion`` either, so ``reduced_motion()`` is the switch
+  every animation is gated on.
+"""
+
+import os
+from string import Template
+
 from PyQt6.QtWidgets import QApplication
 
-# Colour palette
-# BASE_BG    #0D0D0D  root window / deep-black canvas
-# SURFACE    #0D1B2A  panel / card / dialog surface (deep dark blue)
-# RAISED     #163046  toolbar / button fill (raised above surface)
-# RAISED_HI  #1E4264  raised bevel lighter edge (top-left)
-# RAISED_LO  #060F1A  raised bevel darker edge (bottom-right)
-# INSET_BG   #07111C  input / list background (recessed below surface)
-# INSET_SH   #030A12  inset bevel shadow (top-left darker)
-# INSET_LF   #172D44  inset bevel lift (bottom-right lighter)
-# BORDER     #1A3048  standard border / divider
-# TEXT       #e0d8cc  primary text
-# TEXT_DIM   #6888A0  muted / secondary text (blue-grey)
-# ACCENT     #F26822  primary orange accent (selections, focus, primary actions)
-# ACCENT_DK  #c44f10  pressed accent
-# ALT_ROW    #0A1826  alternating table row
-# HOVER      #142840  hover surface highlight
+# --------------------------------------------------------------------------------------
+# Ground
+# --------------------------------------------------------------------------------------
+CANVAS = "#0A0A0C"        # root; the majority of pixels on screen
+CANVAS_DEEP = "#060608"   # gradient far end (window edges)
+ANCHOR = "#1A1046"        # deep indigo; gradient toward, and the base of every glow
 
-_STYLESHEET = """
-/* ================================================================
-   Base
-   ================================================================ */
+# --------------------------------------------------------------------------------------
+# Glass (QSS alpha is an integer 0-255, never a 0-1 float)
+# --------------------------------------------------------------------------------------
+PANEL_FILL = "rgba(255, 255, 255, 14)"
+PANEL_FILL_HI = "rgba(255, 255, 255, 22)"   # dialogs and the command bar
+PANEL_BORDER = "rgba(255, 255, 255, 38)"
+PANEL_EDGE_TOP = "rgba(255, 255, 255, 58)"  # bright top hairline on chrome only
+INSET_FILL = "rgba(0, 0, 0, 120)"           # inputs and lists: recessed, darker than host
+INSET_BORDER = "rgba(255, 255, 255, 26)"
+
+# --------------------------------------------------------------------------------------
+# Accents (each owns a region; never reuse one for a second region)
+# --------------------------------------------------------------------------------------
+ACCENT_CYAN = "#22E1FF"     # results/search region, primary action, focus, selection
+ACCENT_LIME = "#8FE84A"     # collections/tags region, success
+ACCENT_MAGENTA = "#FF5CB0"  # paper-detail region, tag chips
+ACCENT_AMBER = "#FFB03A"    # import region, needs-review state
+ACCENT_RED = "#FF5A5A"      # destructive actions, errors
+
+# --------------------------------------------------------------------------------------
+# Text
+# --------------------------------------------------------------------------------------
+TEXT_PRIMARY = "#EDEDF2"
+TEXT_SECONDARY = "#B9BAC7"   # deliberately above the #888-#AAA band, which fails the floor
+TEXT_ON_ACCENT = "#0A0A0C"   # near-black; verified against all five accents
+
+# --------------------------------------------------------------------------------------
+# Type
+# --------------------------------------------------------------------------------------
+FONT_UI = "'Tahoma', 'Segoe UI', sans-serif"
+FONT_MONO = "'Consolas', 'Cascadia Mono', monospace"
+
+# --------------------------------------------------------------------------------------
+# Form
+# --------------------------------------------------------------------------------------
+SPACE = 8            # one unit. Panel gaps 24 (3u), panel padding 16 (2u), intra-group 8
+RADIUS_PANEL = 14
+RADIUS_CONTROL = 8
+RADIUS_INPUT = 6
+
+# --------------------------------------------------------------------------------------
+# Motion (ms)
+# --------------------------------------------------------------------------------------
+MOTION_HOVER = 140
+MOTION_BASE = 220
+MOTION_CELEBRATE = 600
+
+# --------------------------------------------------------------------------------------
+# Private derivations. Popups (menus, tooltips, combo lists) are top-level windows with
+# nothing of ours behind them, so translucent glass would composite against the desktop.
+# They get a solid backing at the value glass over canvas resolves to. The accent shades
+# are lighter/darker steps of ACCENT_CYAN and ACCENT_RED for hover and press, not new hues.
+# --------------------------------------------------------------------------------------
+_POPUP_BACKING = "#12121A"
+_CYAN_HI = "#6BECFF"
+_CYAN_LO = "#12B4CE"
+_MAGENTA_HI = "#FF8FCB"
+_MAGENTA_LO = "#D93A8C"
+_RED_HI = "#FF8080"
+_RED_LO = "#D93F3F"
+_HOVER_LIFT = "rgba(255, 255, 255, 18)"     # translucent lift, never a colour swap
+_HOVER_FILL = "rgba(255, 255, 255, 34)"
+_HOVER_BORDER = "rgba(255, 255, 255, 72)"
+_PRESS_FILL = "rgba(0, 0, 0, 90)"
+_DISABLED_FILL = "rgba(255, 255, 255, 8)"
+_DISABLED_BORDER = "rgba(255, 255, 255, 20)"
+_DISABLED_TEXT = "rgba(185, 186, 199, 120)"
+_ALT_ROW = "rgba(255, 255, 255, 8)"
+_GRID_LINE = "rgba(255, 255, 255, 18)"
+_FOCUS_RING = "rgba(34, 225, 255, 120)"
+_TRACK = "rgba(0, 0, 0, 90)"
+
+_QSS = """
+/* ======================================================================
+   Base. The canvas is the dominant colour of the interface.
+   ====================================================================== */
 QWidget {
-    background-color: #0D0D0D;
-    color: #e0d8cc;
-    font-family: "Segoe UI", sans-serif;
+    background-color: ${CANVAS};
+    color: ${TEXT_PRIMARY};
+    font-family: ${FONT_UI};
     font-size: 9pt;
 }
 
-QMainWindow {
-    background-color: #0D0D0D;
-}
-
-QDialog {
-    background-color: #0D1B2A;
-}
-
-QDialog QWidget {
-    background-color: #0D1B2A;
-}
-
-/* ================================================================
-   Toolbar
-   ================================================================ */
-QToolBar {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #181818, stop:1 #0D0D0D);
-    border: none;
-    border-bottom: 1px solid #060F1A;
-    padding: 3px 6px;
-    spacing: 5px;
-}
-
-QToolBar QWidget {
+/* Plain QWidget instances only: anonymous layout containers, scroll-area
+   viewports and content holders inside a glass panel. */
+.QWidget {
     background: transparent;
 }
 
-QToolBar::separator {
-    background-color: #1A3048;
-    width: 1px;
-    margin: 4px 4px;
+QMainWindow,
+QDialog {
+    background-color: ${CANVAS};
 }
 
-/* ================================================================
-   Push buttons  (raised bevel: light top-left, dark bottom-right)
-   ================================================================ */
-QPushButton {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4264, stop:1 #122840);
-    color: #e0d8cc;
-    border-style: solid;
-    border-width: 1px;
-    border-color: #060F1A #060F1A #060F1A #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    border-radius: 2px;
-    padding: 3px 10px;
-    min-height: 20px;
+QSplitter,
+QStackedWidget,
+QScrollArea,
+QTabWidget,
+QToolBar,
+QStatusBar,
+QLabel,
+QCheckBox,
+QRadioButton {
+    background: transparent;
 }
 
-QPushButton:hover {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #244E6C, stop:1 #1A3A58);
-    border-top-color: #2A5A7A;
-    border-left-color: #2A5A7A;
+QScrollArea {
+    border: none;
 }
 
-QPushButton:pressed {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #08121C, stop:1 #101E30);
-    border-top-color: #060F1A;
-    border-left-color: #060F1A;
-    border-bottom-color: #1E4264;
-    border-right-color: #1E4264;
+QToolBar {
+    border: none;
+    padding: ${SPACE}px;
+    spacing: ${SPACE}px;
 }
 
-QPushButton:disabled {
-    background: #0C1E2E;
-    color: #3A5070;
-    border-color: #102234;
+QStatusBar {
+    color: ${TEXT_SECONDARY};
+    border: none;
 }
 
-/* Primary action button — set objectName="primary" to activate */
-QPushButton[objectName="primary"] {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #f87c38, stop:1 #d05618);
-    color: #ffffff;
-    border-top-color: #ff9958;
-    border-left-color: #ff9958;
-    border-bottom-color: #903410;
-    border-right-color: #903410;
+/* A group heading inside a panel (the filter column, the paper form's sections).
+   Bold at body size and one step back from the controls it leads: the structure
+   comes from the weight and the space around it, never from shrinking the type. */
+QLabel#FilterGroupLabel,
+QLabel#FieldGroupLabel {
+    color: ${TEXT_SECONDARY};
     font-weight: bold;
 }
 
-QPushButton[objectName="primary"]:hover {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #ff8840, stop:1 #e06020);
+/* A field's own label, inside a group. Same colour as the group heading and a
+   step below it in weight, so the value in the input is the brightest thing in
+   the panel and the two levels of label are told apart by weight alone. */
+QLabel#FieldLabel {
+    color: ${TEXT_SECONDARY};
 }
 
-QPushButton[objectName="primary"]:pressed {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #b84808, stop:1 #d05618);
-    border-top-color: #903410;
-    border-left-color: #903410;
-    border-bottom-color: #ff9958;
-    border-right-color: #ff9958;
+/* The needs-review state, worn beside the panel title as a small amber pill. A
+   banner across the top of the form would be read as decoration and skipped; this
+   is one chip and a matching edge on the fields whose values are actually in
+   doubt, which is a state the eye can attach to something. */
+QLabel#ReviewChip {
+    background-color: ${ACCENT_AMBER};
+    color: ${TEXT_ON_ACCENT};
+    border: 1px solid ${ACCENT_AMBER};
+    border-radius: 11px;
+    padding: 2px 10px;
+    font-weight: bold;
 }
 
-/* ================================================================
-   Input fields  (inset bevel: dark top-left, lighter bottom-right)
-   ================================================================ */
+/* Display type: the largest heading in the application, carried by the first-run
+   screen. Size and weight live here because a stylesheet outranks setFont;
+   tracking is pulled in by glass.display_font, since QSS has no letter-spacing. */
+QLabel#DisplayHeading {
+    color: ${TEXT_PRIMARY};
+    font-size: 26pt;
+    font-weight: bold;
+}
+
+QLabel#DisplaySubtitle {
+    color: ${TEXT_SECONDARY};
+    font-size: 12pt;
+}
+
+/* An explanatory line under a field, a table or a form. Secondary in colour and
+   never in size: it is the only place some of this is said, and shrinking it
+   below the body size fails the legibility floor. */
+QLabel#FieldNote {
+    color: ${TEXT_SECONDARY};
+}
+
+/* Fixed-width output: the import and categorisation logs, where the columns are
+   the medium. The only monospace in the application outside them. */
+#LogView {
+    font-family: ${FONT_MONO};
+}
+
+/* ======================================================================
+   Glass panels. Styled by object name so no widget class is claimed.
+   ====================================================================== */
+#GlassPanel {
+    background-color: ${PANEL_FILL};
+    border: 1px solid ${PANEL_BORDER};
+    border-top-color: ${PANEL_EDGE_TOP};
+    border-radius: ${RADIUS_PANEL}px;
+}
+
+/* Chrome carries the identity harder: command bar, dialog headers. */
+#GlassPanel[chrome="true"] {
+    background-color: ${PANEL_FILL_HI};
+}
+
+/* ======================================================================
+   Inputs. Recessed: darker than their host panel, tighter radius, no lift.
+   ====================================================================== */
 QLineEdit,
+QPlainTextEdit,
+QTextEdit,
 QSpinBox,
 QDoubleSpinBox,
-QPlainTextEdit,
-QTextEdit {
-    background-color: #07111C;
-    color: #e0d8cc;
-    border-style: solid;
-    border-width: 1px;
-    border-color: #1A3048;
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #172D44;
-    border-right-color: #172D44;
-    border-radius: 2px;
-    padding: 2px 4px;
-    selection-background-color: #F26822;
-    selection-color: #ffffff;
+QComboBox {
+    background-color: ${INSET_FILL};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${INSET_BORDER};
+    border-radius: ${RADIUS_INPUT}px;
+    padding: 5px 8px;
+    selection-background-color: ${ACCENT_CYAN};
+    selection-color: ${TEXT_ON_ACCENT};
+}
+
+QLineEdit:hover,
+QPlainTextEdit:hover,
+QTextEdit:hover,
+QSpinBox:hover,
+QDoubleSpinBox:hover,
+QComboBox:hover {
+    border-color: ${PANEL_BORDER};
 }
 
 QLineEdit:focus,
+QPlainTextEdit:focus,
+QTextEdit:focus,
 QSpinBox:focus,
 QDoubleSpinBox:focus,
-QPlainTextEdit:focus,
-QTextEdit:focus {
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #F26822;
-    border-right-color: #F26822;
+QComboBox:focus {
+    border-color: ${ACCENT_CYAN};
 }
 
 QLineEdit:disabled,
+QPlainTextEdit:disabled,
+QTextEdit:disabled,
 QSpinBox:disabled,
 QDoubleSpinBox:disabled,
-QPlainTextEdit:disabled,
-QTextEdit:disabled {
-    background-color: #0A1826;
-    color: #3A5070;
+QComboBox:disabled {
+    color: ${DISABLED_TEXT};
+    border-color: ${DISABLED_BORDER};
 }
 
-QSpinBox::up-button,
-QSpinBox::down-button,
-QDoubleSpinBox::up-button,
-QDoubleSpinBox::down-button {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4264, stop:1 #122840);
-    border-left: 1px solid #030A12;
-    width: 14px;
-    subcontrol-origin: border;
+/* Needs review, marked on the field itself. Only the left edge, so hover and
+   focus still read on the other three. */
+QLineEdit[review="true"],
+QSpinBox[review="true"] {
+    border-left-color: ${ACCENT_AMBER};
 }
 
-QSpinBox::up-button,
-QDoubleSpinBox::up-button {
-    subcontrol-position: top right;
-    border-top: none;
-    border-bottom: 1px solid #1A3048;
+/* The spin-box stepper sub-controls and the combo-box drop-down are
+   deliberately left unstyled: giving them any rule switches them to CSS box
+   layout and collapses their arrow glyphs to invisible. */
+
+/* ======================================================================
+   Buttons. Glass, with a lift in fill and border on hover.
+   ====================================================================== */
+QPushButton {
+    background-color: ${PANEL_FILL_HI};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${PANEL_BORDER};
+    border-radius: ${RADIUS_CONTROL}px;
+    padding: 6px 16px;
+    min-height: 22px;
 }
 
-QSpinBox::down-button,
-QDoubleSpinBox::down-button {
-    subcontrol-position: bottom right;
-    border-top: 1px solid #1A3048;
-    border-bottom: none;
+QPushButton:hover {
+    background-color: ${HOVER_FILL};
+    border-color: ${HOVER_BORDER};
 }
 
-QSpinBox::up-button:hover,
-QDoubleSpinBox::up-button:hover,
-QSpinBox::down-button:hover,
-QDoubleSpinBox::down-button:hover {
-    background: #F26822;
+QPushButton:pressed {
+    background-color: ${PRESS_FILL};
+    border-color: ${PANEL_BORDER};
 }
 
-/* ================================================================
-   Table views  (inset)
-   ================================================================ */
-QTableView,
-QTableWidget {
-    background-color: #0D0D0D;
-    alternate-background-color: #111111;
-    color: #e0d8cc;
-    border-style: solid;
-    border-width: 1px;
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #1A3048;
-    border-right-color: #1A3048;
-    gridline-color: #1A1A1A;
-    selection-background-color: #F26822;
-    selection-color: #ffffff;
-    outline: none;
+QPushButton:focus {
+    border-color: ${ACCENT_CYAN};
 }
 
-QTableView::item:hover,
-QTableWidget::item:hover {
-    background-color: #1A1A1A;
+QPushButton:disabled {
+    background-color: ${DISABLED_FILL};
+    color: ${TEXT_SECONDARY};
+    border-color: ${DISABLED_BORDER};
 }
 
-QTableView::item:selected,
-QTableWidget::item:selected {
-    background-color: #F26822;
-    color: #ffffff;
-}
-
-QHeaderView {
-    background-color: #0D0D0D;
-}
-
-QHeaderView::section {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1A1A1A, stop:1 #0F0F0F);
-    color: #e0d8cc;
-    border: none;
-    border-right: 1px solid #1A3048;
-    border-bottom: 1px solid #030A12;
-    padding: 3px 6px;
+QPushButton#primary {
+    background-color: ${ACCENT_CYAN};
+    color: ${TEXT_ON_ACCENT};
+    border-color: ${ACCENT_CYAN};
     font-weight: bold;
 }
 
-QHeaderView::section:hover {
-    background: #222222;
+QPushButton#primary:hover {
+    background-color: ${CYAN_HI};
+    border-color: ${CYAN_HI};
 }
 
-QHeaderView::section:first {
-    border-left: none;
+QPushButton#primary:pressed {
+    background-color: ${CYAN_LO};
+    border-color: ${CYAN_LO};
 }
 
-/* ================================================================
-   Tree view
-   ================================================================ */
-QTreeView {
-    background-color: #0D1B2A;
-    color: #e0d8cc;
-    border-style: solid;
-    border-width: 1px;
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #172D44;
-    border-right-color: #172D44;
-    selection-background-color: #F26822;
-    selection-color: #ffffff;
+QPushButton#primary:disabled {
+    background-color: ${DISABLED_FILL};
+    color: ${TEXT_SECONDARY};
+    border-color: ${DISABLED_BORDER};
+}
+
+QPushButton#danger {
+    background-color: ${ACCENT_RED};
+    color: ${TEXT_ON_ACCENT};
+    border-color: ${ACCENT_RED};
+    font-weight: bold;
+}
+
+QPushButton#danger:hover {
+    background-color: ${RED_HI};
+    border-color: ${RED_HI};
+}
+
+QPushButton#danger:pressed {
+    background-color: ${RED_LO};
+    border-color: ${RED_LO};
+}
+
+QPushButton#danger:disabled {
+    background-color: ${DISABLED_FILL};
+    color: ${TEXT_SECONDARY};
+    border-color: ${DISABLED_BORDER};
+}
+
+/* Tag chips: the paper panel's one piece of personality, in that region's
+   magenta. Filling with the accent on hover makes the trailing glyph read as the
+   removal it is; the glyph itself is present at rest, so the affordance never
+   depends on a cursor being there. */
+QPushButton#TagChip {
+    background-color: ${PANEL_FILL_HI};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${ACCENT_MAGENTA};
+    border-radius: 11px;
+    padding: 2px 6px;
+    min-height: 16px;
+}
+
+QPushButton#TagChip:hover {
+    background-color: ${ACCENT_MAGENTA};
+    color: ${TEXT_ON_ACCENT};
+    border-color: ${ACCENT_MAGENTA};
+}
+
+QPushButton#TagChip:pressed {
+    background-color: ${MAGENTA_LO};
+    border-color: ${MAGENTA_LO};
+    color: ${TEXT_ON_ACCENT};
+}
+
+QPushButton#TagChip:focus {
+    background-color: ${HOVER_FILL};
+    border-color: ${MAGENTA_HI};
+}
+
+QDialogButtonBox QPushButton {
+    min-width: 84px;
+}
+
+/* ======================================================================
+   Item views. Dense inside, recessed against the panel around them.
+   ====================================================================== */
+QTableView,
+QTableWidget,
+QTreeView,
+QListView,
+QListWidget {
+    background-color: ${INSET_FILL};
+    alternate-background-color: ${ALT_ROW};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${INSET_BORDER};
+    border-radius: ${RADIUS_INPUT}px;
+    gridline-color: ${GRID_LINE};
+    selection-background-color: ${ACCENT_CYAN};
+    selection-color: ${TEXT_ON_ACCENT};
     outline: none;
 }
 
-QTreeView::item:hover {
-    background-color: #142840;
+QTableView:focus,
+QTableWidget:focus,
+QTreeView:focus,
+QListView:focus,
+QListWidget:focus {
+    border-color: ${FOCUS_RING};
 }
 
-QTreeView::item:selected {
-    background-color: #F26822;
-    color: #ffffff;
+QTableView::item,
+QTableWidget::item,
+QTreeView::item,
+QListView::item,
+QListWidget::item {
+    padding: 3px 6px;
+    border: none;
+}
+
+QTableView::item:hover,
+QTableWidget::item:hover,
+QTreeView::item:hover,
+QListView::item:hover,
+QListWidget::item:hover {
+    background-color: ${HOVER_LIFT};
+}
+
+QTableView::item:selected,
+QTableWidget::item:selected,
+QTreeView::item:selected,
+QListView::item:selected,
+QListWidget::item:selected {
+    background-color: ${ACCENT_CYAN};
+    color: ${TEXT_ON_ACCENT};
 }
 
 QTreeView::branch {
-    background-color: #0D1B2A;
+    background: transparent;
 }
 
-QTreeView::branch:has-children:!has-siblings:closed,
-QTreeView::branch:closed:has-children:has-siblings {
-    border-image: none;
-    image: none;
+QHeaderView {
+    background: transparent;
+    border: none;
 }
 
-/* ================================================================
-   List widget
-   ================================================================ */
-QListWidget {
-    background-color: #07111C;
-    color: #e0d8cc;
-    border-style: solid;
-    border-width: 1px;
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #172D44;
-    border-right-color: #172D44;
-    selection-background-color: #F26822;
-    selection-color: #ffffff;
-    outline: none;
+QHeaderView::section {
+    background-color: ${PANEL_FILL};
+    color: ${TEXT_SECONDARY};
+    font-weight: bold;
+    border: none;
+    border-right: 1px solid ${GRID_LINE};
+    border-bottom: 1px solid ${PANEL_BORDER};
+    padding: 6px 10px;
 }
 
-QListWidget::item:hover {
-    background-color: #142840;
+QHeaderView::section:hover {
+    background-color: ${PANEL_FILL_HI};
+    color: ${TEXT_PRIMARY};
 }
 
-QListWidget::item:selected {
-    background-color: #F26822;
-    color: #ffffff;
+QHeaderView::section:last {
+    border-right: none;
 }
 
-/* ================================================================
-   Scroll bars  (traditional, always visible, 14 px wide)
-   ================================================================ */
+QTableCornerButton::section {
+    background-color: ${PANEL_FILL};
+    border: none;
+    border-bottom: 1px solid ${PANEL_BORDER};
+}
+
+/* ======================================================================
+   Scroll bars. Traditional and always visible: 14px, a glass handle with
+   real mass, never an overlay that hides itself.
+   ====================================================================== */
 QScrollBar:vertical {
-    background-color: #0D0D0D;
-    border-left: 1px solid #060F1A;
+    background-color: ${TRACK};
+    border: none;
+    border-radius: ${RADIUS_CONTROL}px;
     width: 14px;
-    margin: 14px 0 14px 0;
-}
-
-QScrollBar::handle:vertical {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #1E4060, stop:1 #163046);
-    border: 1px solid #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    min-height: 20px;
     margin: 0;
-}
-
-QScrollBar::handle:vertical:hover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #F26822, stop:1 #c85010);
-    border-top-color: #ff9958;
-}
-
-QScrollBar::add-line:vertical {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4264, stop:1 #122840);
-    border: 1px solid #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    height: 14px;
-    subcontrol-position: bottom;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::sub-line:vertical {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4264, stop:1 #122840);
-    border: 1px solid #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    height: 14px;
-    subcontrol-position: top;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::add-line:vertical:hover,
-QScrollBar::sub-line:vertical:hover {
-    background: #F26822;
 }
 
 QScrollBar:horizontal {
-    background-color: #0D0D0D;
-    border-top: 1px solid #060F1A;
+    background-color: ${TRACK};
+    border: none;
+    border-radius: ${RADIUS_CONTROL}px;
     height: 14px;
-    margin: 0 14px 0 14px;
-}
-
-QScrollBar::handle:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4060, stop:1 #163046);
-    border: 1px solid #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    min-width: 20px;
     margin: 0;
 }
 
+QScrollBar::handle:vertical {
+    background-color: ${PANEL_FILL_HI};
+    border: 1px solid ${PANEL_BORDER};
+    border-radius: ${RADIUS_CONTROL}px;
+    min-height: 32px;
+    margin: 3px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: ${PANEL_FILL_HI};
+    border: 1px solid ${PANEL_BORDER};
+    border-radius: ${RADIUS_CONTROL}px;
+    min-width: 32px;
+    margin: 3px;
+}
+
+QScrollBar::handle:vertical:hover,
 QScrollBar::handle:horizontal:hover {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #F26822, stop:1 #c85010);
-    border-top-color: #ff9958;
+    background-color: ${ACCENT_CYAN};
+    border-color: ${ACCENT_CYAN};
 }
 
-QScrollBar::add-line:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4264, stop:1 #122840);
-    border: 1px solid #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    width: 14px;
-    subcontrol-position: right;
-    subcontrol-origin: margin;
+QScrollBar::handle:vertical:pressed,
+QScrollBar::handle:horizontal:pressed {
+    background-color: ${CYAN_LO};
+    border-color: ${CYAN_LO};
 }
 
+/* No stepper buttons: styling them would collapse their arrows, so the
+   track is given over entirely to the handle. */
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical,
+QScrollBar::add-line:horizontal,
 QScrollBar::sub-line:horizontal {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #1E4264, stop:1 #122840);
-    border: 1px solid #060F1A;
-    border-top-color: #1E4264;
-    border-left-color: #1E4264;
-    width: 14px;
-    subcontrol-position: left;
-    subcontrol-origin: margin;
-}
-
-QScrollBar::add-line:horizontal:hover,
-QScrollBar::sub-line:horizontal:hover {
-    background: #F26822;
+    background: none;
+    border: none;
+    width: 0;
+    height: 0;
 }
 
 QScrollBar::add-page,
@@ -426,164 +547,346 @@ QScrollBar::sub-page {
     background: none;
 }
 
-/* ================================================================
-   Splitter
-   ================================================================ */
+/* ======================================================================
+   Splitter. The gap between panels is canvas, not chrome.
+   ====================================================================== */
 QSplitter::handle {
-    background-color: #060F1A;
+    background-color: transparent;
 }
 
 QSplitter::handle:horizontal {
-    width: 3px;
+    width: 20px;
 }
 
 QSplitter::handle:vertical {
-    height: 3px;
+    height: 20px;
 }
 
-QSplitter::handle:hover {
-    background-color: #F26822;
+QSplitter::handle:horizontal:hover {
+    background-color: ${ACCENT_CYAN};
+    margin: 0 9px;
 }
 
-/* ================================================================
-   Status bar
-   ================================================================ */
-QStatusBar {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #0F2035, stop:1 #0D0D0D);
-    color: #6888A0;
-    border-top: 1px solid #060F1A;
-    font-size: 8pt;
+QSplitter::handle:vertical:hover {
+    background-color: ${ACCENT_CYAN};
+    margin: 9px 0;
 }
 
-/* ================================================================
-   Menu
-   ================================================================ */
+/* ======================================================================
+   Popups. Top-level windows, so a solid backing rather than glass.
+   ====================================================================== */
+QMenuBar {
+    background: transparent;
+    border: none;
+}
+
+QMenuBar::item {
+    background: transparent;
+    padding: 6px 10px;
+    border-radius: ${RADIUS_CONTROL}px;
+}
+
+QMenuBar::item:selected {
+    background-color: ${HOVER_LIFT};
+}
+
 QMenu {
-    background-color: #0F2035;
-    color: #e0d8cc;
-    border: 1px solid #1A3048;
-    padding: 2px 0;
+    background-color: ${POPUP_BACKING};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${PANEL_BORDER};
+    border-radius: ${RADIUS_CONTROL}px;
+    padding: 6px;
 }
 
 QMenu::item {
-    padding: 4px 20px 4px 8px;
+    padding: 6px 24px 6px 12px;
+    border-radius: ${RADIUS_INPUT}px;
 }
 
 QMenu::item:selected {
-    background-color: #F26822;
-    color: #ffffff;
+    background-color: ${ACCENT_CYAN};
+    color: ${TEXT_ON_ACCENT};
 }
 
 QMenu::item:disabled {
-    color: #3A5070;
+    color: ${DISABLED_TEXT};
 }
 
 QMenu::separator {
-    background-color: #1A3048;
+    background-color: ${PANEL_BORDER};
     height: 1px;
-    margin: 3px 6px;
+    margin: 6px 8px;
 }
 
-/* ================================================================
-   Group box
-   ================================================================ */
+QComboBox QAbstractItemView {
+    background-color: ${POPUP_BACKING};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${PANEL_BORDER};
+    border-radius: ${RADIUS_INPUT}px;
+    padding: 4px;
+    selection-background-color: ${ACCENT_CYAN};
+    selection-color: ${TEXT_ON_ACCENT};
+    outline: none;
+}
+
+QToolTip {
+    background-color: ${POPUP_BACKING};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${PANEL_BORDER};
+    border-radius: ${RADIUS_INPUT}px;
+    padding: 6px 10px;
+}
+
+/* ======================================================================
+   Group boxes. Glass, so dialogs need no per-dialog styling.
+   ====================================================================== */
 QGroupBox {
-    background-color: #0D1B2A;
-    border: 1px solid #1A3048;
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #172D44;
-    border-right-color: #172D44;
-    border-radius: 3px;
-    margin-top: 10px;
-    padding-top: 10px;
+    background-color: ${PANEL_FILL};
+    border: 1px solid ${PANEL_BORDER};
+    border-top-color: ${PANEL_EDGE_TOP};
+    border-radius: ${RADIUS_PANEL}px;
+    /* The title is drawn in this margin band (subcontrol-origin: margin below), so the
+       band has to clear the full height of 9pt bold type. At 14px the ascenders were
+       clipped by whatever sat above the box, which for the first group in a scroll area
+       is the viewport edge. */
+    margin-top: 20px;
+    padding: 20px 16px 16px 16px;
     font-weight: bold;
-    color: #e0d8cc;
+    color: ${TEXT_PRIMARY};
 }
 
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    left: 8px;
-    top: -1px;
-    padding: 0 5px;
-    color: #F26822;
-    background-color: #0D1B2A;
-}
-
-/* ================================================================
-   Checkbox
-   ================================================================ */
-QCheckBox {
-    color: #e0d8cc;
-    spacing: 6px;
+    left: 14px;
+    padding: 0 6px;
+    color: ${TEXT_SECONDARY};
     background: transparent;
 }
 
-QCheckBox::indicator {
-    width: 13px;
-    height: 13px;
-    background-color: #07111C;
-    border-style: solid;
-    border-width: 1px;
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #172D44;
-    border-right-color: #172D44;
-    border-radius: 1px;
+/* A group that belongs to a region wears that region's hue in its title, the
+   same way a GlassPanel does. Set the dynamic property `accent` on the box. */
+QGroupBox[accent="amber"]::title {
+    color: ${ACCENT_AMBER};
 }
 
-QCheckBox::indicator:checked {
-    background-color: #F26822;
-    border-color: #c44f10;
+QGroupBox[accent="lime"]::title {
+    color: ${ACCENT_LIME};
 }
 
-QCheckBox::indicator:hover {
-    border-top-color: #030A12;
-    border-left-color: #030A12;
-    border-bottom-color: #F26822;
-    border-right-color: #F26822;
+QGroupBox[accent="cyan"]::title {
+    color: ${ACCENT_CYAN};
 }
 
-/* ================================================================
-   Labels
-   ================================================================ */
-QLabel {
+/* ======================================================================
+   Check boxes and radio buttons. A filled accent indicator: colour carries
+   the state, so it reads without relying on a glyph.
+   ====================================================================== */
+QCheckBox,
+QRadioButton {
+    spacing: ${SPACE}px;
+}
+
+QCheckBox::indicator,
+QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+    background-color: ${INSET_FILL};
+    border: 1px solid ${INSET_BORDER};
+    border-radius: 3px;
+}
+
+QRadioButton::indicator {
+    border-radius: 8px;
+}
+
+QCheckBox::indicator:hover,
+QRadioButton::indicator:hover,
+QCheckBox:focus::indicator,
+QRadioButton:focus::indicator {
+    border-color: ${ACCENT_CYAN};
+}
+
+QCheckBox::indicator:checked,
+QRadioButton::indicator:checked {
+    background-color: ${ACCENT_CYAN};
+    border-color: ${ACCENT_CYAN};
+}
+
+QCheckBox::indicator:disabled,
+QRadioButton::indicator:disabled {
+    background-color: ${DISABLED_FILL};
+    border-color: ${DISABLED_BORDER};
+}
+
+QCheckBox:disabled,
+QRadioButton:disabled {
+    color: ${TEXT_SECONDARY};
+}
+
+/* ======================================================================
+   Tabs.
+   ====================================================================== */
+QTabWidget::pane {
     background: transparent;
-    color: #e0d8cc;
-}
-
-/* ================================================================
-   Scroll area
-   ================================================================ */
-QScrollArea {
     border: none;
+    border-top: 1px solid ${PANEL_BORDER};
+    top: -1px;
+}
+
+QTabBar {
     background: transparent;
 }
 
-QScrollArea > QWidget > QWidget {
+QTabBar::tab {
     background: transparent;
+    color: ${TEXT_SECONDARY};
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 16px;
+    margin-right: 4px;
 }
 
-/* ================================================================
-   Dialog button box
-   ================================================================ */
-QDialogButtonBox QPushButton {
-    min-width: 72px;
+QTabBar::tab:hover {
+    background-color: ${HOVER_LIFT};
+    color: ${TEXT_PRIMARY};
 }
 
-/* ================================================================
-   Tooltip
-   ================================================================ */
-QToolTip {
-    background-color: #102234;
-    color: #e0d8cc;
-    border: 1px solid #F26822;
-    padding: 3px 6px;
+QTabBar::tab:selected {
+    color: ${TEXT_PRIMARY};
+    border-bottom-color: ${ACCENT_CYAN};
+    font-weight: bold;
+}
+
+QTabBar::tab:focus {
+    border-bottom-color: ${ACCENT_CYAN};
+}
+
+/* ======================================================================
+   Progress. Visible mass on an inset groove.
+   ====================================================================== */
+QProgressBar {
+    background-color: ${INSET_FILL};
+    color: ${TEXT_PRIMARY};
+    border: 1px solid ${INSET_BORDER};
+    border-radius: ${RADIUS_CONTROL}px;
+    min-height: 12px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background-color: ${ACCENT_CYAN};
+    border-radius: ${RADIUS_CONTROL}px;
+}
+
+/* A region's progress: no text on the bar (the counts row beside it says the
+   same thing in words), so the bar can be a slim band of pure colour instead. */
+QProgressBar[accent="amber"],
+QProgressBar[accent="lime"] {
+    min-height: 10px;
+    max-height: 10px;
+}
+
+QProgressBar[accent="amber"]::chunk {
+    background-color: ${ACCENT_AMBER};
+}
+
+QProgressBar[accent="lime"]::chunk {
+    background-color: ${ACCENT_LIME};
 }
 """
 
+_TOKENS: dict[str, str] = {
+    "CANVAS": CANVAS,
+    "CANVAS_DEEP": CANVAS_DEEP,
+    "ANCHOR": ANCHOR,
+    "PANEL_FILL": PANEL_FILL,
+    "PANEL_FILL_HI": PANEL_FILL_HI,
+    "PANEL_BORDER": PANEL_BORDER,
+    "PANEL_EDGE_TOP": PANEL_EDGE_TOP,
+    "INSET_FILL": INSET_FILL,
+    "INSET_BORDER": INSET_BORDER,
+    "ACCENT_CYAN": ACCENT_CYAN,
+    "ACCENT_LIME": ACCENT_LIME,
+    "ACCENT_MAGENTA": ACCENT_MAGENTA,
+    "ACCENT_AMBER": ACCENT_AMBER,
+    "ACCENT_RED": ACCENT_RED,
+    "TEXT_PRIMARY": TEXT_PRIMARY,
+    "TEXT_SECONDARY": TEXT_SECONDARY,
+    "TEXT_ON_ACCENT": TEXT_ON_ACCENT,
+    "FONT_UI": FONT_UI,
+    "FONT_MONO": FONT_MONO,
+    "SPACE": str(SPACE),
+    "RADIUS_PANEL": str(RADIUS_PANEL),
+    "RADIUS_CONTROL": str(RADIUS_CONTROL),
+    "RADIUS_INPUT": str(RADIUS_INPUT),
+    "POPUP_BACKING": _POPUP_BACKING,
+    "CYAN_HI": _CYAN_HI,
+    "CYAN_LO": _CYAN_LO,
+    "MAGENTA_HI": _MAGENTA_HI,
+    "MAGENTA_LO": _MAGENTA_LO,
+    "RED_HI": _RED_HI,
+    "RED_LO": _RED_LO,
+    "HOVER_LIFT": _HOVER_LIFT,
+    "HOVER_FILL": _HOVER_FILL,
+    "HOVER_BORDER": _HOVER_BORDER,
+    "PRESS_FILL": _PRESS_FILL,
+    "DISABLED_FILL": _DISABLED_FILL,
+    "DISABLED_BORDER": _DISABLED_BORDER,
+    "DISABLED_TEXT": _DISABLED_TEXT,
+    "ALT_ROW": _ALT_ROW,
+    "GRID_LINE": _GRID_LINE,
+    "FOCUS_RING": _FOCUS_RING,
+    "TRACK": _TRACK,
+}
+
+STYLESHEET: str = Template(_QSS).substitute(_TOKENS)
+
+
+def _env_reduced_motion() -> bool | None:
+    """The environment's answer, or ``None`` when it has not been given one."""
+    raw = os.environ.get("PAPERBASE_REDUCED_MOTION", "").strip().lower()
+    if not raw:
+        return None
+    return raw in ("1", "true", "yes")
+
+
+# Read once at import. Qt has no prefers-reduced-motion, so these two are the only things
+# standing between the application and an unmet accessibility floor.
+_ENV_REDUCED_MOTION: bool | None = _env_reduced_motion()
+_SETTING_REDUCED_MOTION: bool = False
+
+
+def set_reduced_motion(enabled: bool) -> None:
+    """Push ``Settings.reduce_motion`` into the switch every animation reads.
+
+    Module state rather than an injected object, and deliberately: the animations are
+    built in widget constructors several layers below anything holding a ``Settings``
+    (``GlassPanel``, ``StackFader``), so threading one down to them would put a
+    constructor argument on every panel in the application to carry a single boolean.
+    Exactly two call sites write it, ``main.main`` at startup and
+    ``SettingsDialog._accept`` when the box is ticked, and both are one-way.
+    """
+    global _SETTING_REDUCED_MOTION
+    _SETTING_REDUCED_MOTION = enabled
+
+
+def reduced_motion() -> bool:
+    """True when animations must collapse to instant state changes.
+
+    ``PAPERBASE_REDUCED_MOTION`` (``1``/``true``/``yes``, any case) overrides the setting
+    in either direction whenever it holds a non-empty value; it exists so a test run can
+    force either answer regardless of what is in ``settings.json``. Every animation reads
+    this at the moment it would start, so the setting takes effect without a restart.
+    """
+    if _ENV_REDUCED_MOTION is not None:
+        return _ENV_REDUCED_MOTION
+    return _SETTING_REDUCED_MOTION
+
 
 def apply_theme(app: QApplication) -> None:
-    app.setStyleSheet(_STYLESHEET)
+    """Install the global stylesheet. Call immediately after ``QApplication()``."""
+    # Fusion first: the native Windows style ignores parts of the sheet, so the glass
+    # treatment only lands consistently on top of Fusion.
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLESHEET)

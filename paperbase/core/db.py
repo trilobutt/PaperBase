@@ -43,6 +43,11 @@ CREATE INDEX IF NOT EXISTS idx_papers_doi          ON papers(doi);
 CREATE INDEX IF NOT EXISTS idx_papers_year         ON papers(year);
 CREATE INDEX IF NOT EXISTS idx_papers_title        ON papers(title);
 CREATE INDEX IF NOT EXISTS idx_papers_needs_review ON papers(needs_review);
+-- Sort keys for the listing view. NOCASE variants are required because the listing
+-- sorts case-insensitively and a BINARY index cannot serve a NOCASE ORDER BY.
+CREATE INDEX IF NOT EXISTS idx_papers_title_nocase   ON papers(title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_papers_journal_nocase ON papers(journal COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_papers_date_added     ON papers(date_added);
 """
 
 
@@ -130,6 +135,11 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA_SQL)
         self._migrate()
+        # Reused by search_filter as the candidate-id set. Lives in the temp schema, so it
+        # is per-connection and never touches the database file.
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS search_ids (id INTEGER PRIMARY KEY, rank INTEGER)"
+        )
         self._conn.commit()
 
     def _migrate(self) -> None:
@@ -270,18 +280,6 @@ class Database:
         # preserve order
         return [by_id[i] for i in ids if i in by_id]
 
-    def get_all_papers_slim(self) -> list[Paper]:
-        """Fetch all papers ordered by date_added DESC, omitting abstract and keywords.
-
-        Used for the listing view on startup and after clearing a search query.
-        A single query is far cheaper than the two-step ID-list → chunked-IN approach.
-        """
-        conn = self._conn_required()
-        rows = conn.execute(
-            f"SELECT {_SLIM_COLS} FROM papers ORDER BY date_added DESC"
-        ).fetchall()
-        return [_paper_slim_from_row(r) for r in rows]
-
     def get_papers_slim_by_ids(self, ids: list[int]) -> list[Paper]:
         """Like get_papers_by_ids but omits abstract and keywords for fast listing."""
         if not ids:
@@ -322,13 +320,17 @@ class Database:
         return conn.execute("SELECT COUNT(*) FROM papers WHERE needs_review=1").fetchone()[0]
 
     def get_all_tags(self) -> list[str]:
-        """Return sorted unique list of all tags across all papers."""
+        """Return the sorted unique tag list.
+
+        json_each keeps the scan inside SQLite. Parsing 150k JSON arrays in Python took
+        seconds on the startup path.
+        """
         conn = self._conn_required()
-        rows = conn.execute("SELECT tags FROM papers WHERE tags != '[]'").fetchall()
-        tag_set: set[str] = set()
-        for row in rows:
-            tag_set.update(json.loads(row["tags"]))
-        return sorted(tag_set)
+        rows = conn.execute(
+            "SELECT DISTINCT t.value AS tag FROM papers p, json_each(p.tags) t "
+            "WHERE p.tags != '[]' ORDER BY tag COLLATE NOCASE"
+        ).fetchall()
+        return [r["tag"] for r in rows]
 
     def get_all_paper_ids(self) -> list[int]:
         conn = self._conn_required()
@@ -350,82 +352,88 @@ class Database:
         collection_id: Optional[int] = None,
         needs_review_only: bool = False,
         document_type: Optional[str] = None,
+        sort_column: str = "date_added",
+        descending: bool = True,
     ) -> list[int]:
-        """Post-filter paper_ids using SQLite predicates.
+        """Return the ordered paper ids matching every supplied filter.
 
-        paper_ids=None means no Tantivy pre-filter (search all papers).
-        An empty list returns immediately with no results.
+        paper_ids=None means no full-text pre-filter (consider every paper). An empty list
+        means the search matched nothing and is a distinct case from None.
+
+        sort_column is one of: rank, title, authors, journal, year, date_added. "rank"
+        preserves the order of paper_ids and is only meaningful when paper_ids is given.
         """
         if paper_ids is not None and not paper_ids:
             return []
         conn = self._conn_required()
 
-        # Build scalar filters (year, journal, etc.) separately from the ID set
-        # so they can be reused across chunks without reconstruction.
-        scalar_conditions: list[str] = []
-        scalar_params: list[object] = []
+        sort_sql = {
+            "rank":       "s.rank",
+            "title":      "p.title COLLATE NOCASE",
+            "authors":    "p.authors COLLATE NOCASE",
+            "journal":    "p.journal COLLATE NOCASE",
+            "year":       "p.year",
+            "date_added": "p.date_added",
+        }.get(sort_column)
+        if sort_sql is None:
+            raise ValueError(f"Unknown sort column: {sort_column}")
+        if sort_sql == "s.rank" and paper_ids is None:
+            sort_sql, descending = "p.date_added", True
+
+        conditions: list[str] = []
+        params: list[object] = []
 
         if year_from is not None:
-            scalar_conditions.append("year >= ?")
-            scalar_params.append(year_from)
+            conditions.append("p.year >= ?")
+            params.append(year_from)
         if year_to is not None:
-            scalar_conditions.append("year <= ?")
-            scalar_params.append(year_to)
+            conditions.append("p.year <= ?")
+            params.append(year_to)
         if journal:
-            scalar_conditions.append("journal LIKE ?")
-            scalar_params.append(f"%{journal}%")
+            conditions.append("p.journal LIKE ?")
+            params.append(f"%{journal}%")
         if needs_review_only:
-            scalar_conditions.append("needs_review = 1")
+            conditions.append("p.needs_review = 1")
         if document_type is not None:
-            scalar_conditions.append("document_type = ?")
-            scalar_params.append(document_type)
-
-        scalar_where = (" AND " + " AND ".join(scalar_conditions)) if scalar_conditions else ""
-
-        if paper_ids is not None:
-            # Chunk the IN clause at 900 to stay under SQLite's 999-variable limit.
-            # Results from all chunks are unioned into a set, then re-ordered by
-            # Tantivy BM25 rank.
-            chunk_size = 900
-            matched: set[int] = set()
-            for i in range(0, len(paper_ids), chunk_size):
-                chunk = paper_ids[i : i + chunk_size]
-                placeholders = ",".join("?" * len(chunk))
-                rows = conn.execute(
-                    f"SELECT id FROM papers WHERE id IN ({placeholders}){scalar_where}",
-                    list(chunk) + list(scalar_params),
-                ).fetchall()
-                matched.update(r["id"] for r in rows)
-            # Preserve Tantivy BM25 rank order
-            result = [i for i in paper_ids if i in matched]
-        else:
-            where = scalar_where.lstrip(" AND ") or "1=1"
-            rows = conn.execute(
-                f"SELECT id FROM papers WHERE {where} ORDER BY date_added DESC",
-                scalar_params,
-            ).fetchall()
-            result = [r["id"] for r in rows]
-
-        # Tag filter: must hold in Python since tags is a JSON array
+            conditions.append("p.document_type = ?")
+            params.append(document_type)
         if tags:
-            filtered = []
-            for pid in result:
-                paper = self.get_paper(pid)
-                if paper and any(t in paper.tags for t in tags):
-                    filtered.append(pid)
-            result = filtered
-
-        # Collection filter
+            placeholders = ",".join("?" * len(tags))
+            conditions.append(
+                f"EXISTS (SELECT 1 FROM json_each(p.tags) jt WHERE jt.value IN ({placeholders}))"
+            )
+            params.extend(tags)
         if collection_id is not None:
-            col_ids = self._ancestor_and_self(collection_id)
-            filtered2 = []
-            for pid in result:
-                paper = self.get_paper(pid)
-                if paper and any(c in col_ids for c in paper.collection_ids):
-                    filtered2.append(pid)
-            result = filtered2
+            col_ids = sorted(self._ancestor_and_self(collection_id))
+            placeholders = ",".join("?" * len(col_ids))
+            conditions.append(
+                f"EXISTS (SELECT 1 FROM json_each(p.collection_ids) jc "
+                f"WHERE jc.value IN ({placeholders}))"
+            )
+            params.extend(col_ids)
 
-        return result
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        direction = "DESC" if descending else "ASC"
+
+        if paper_ids is None:
+            sql = f"SELECT p.id FROM papers p{where} ORDER BY {sort_sql} {direction}"
+            return [r["id"] for r in conn.execute(sql, params).fetchall()]
+
+        # A temp table beats a chunked IN clause: it has no variable limit, so the whole
+        # candidate set is filtered and ordered in one statement instead of 167 of them.
+        # The table is created once in open(); emptying it avoids DDL on every query.
+        conn.execute("DELETE FROM temp.search_ids")
+        conn.executemany(
+            "INSERT OR IGNORE INTO temp.search_ids (id, rank) VALUES (?, ?)",
+            [(pid, rank) for rank, pid in enumerate(paper_ids)],
+        )
+        join_where = where.replace(" WHERE ", " AND ", 1) if where else ""
+        order = "s.rank ASC" if sort_sql == "s.rank" else f"{sort_sql} {direction}"
+        sql = (
+            f"SELECT p.id FROM papers p JOIN temp.search_ids s ON s.id = p.id"
+            f"{join_where} ORDER BY {order}"
+        )
+        return [r["id"] for r in conn.execute(sql, params).fetchall()]
 
     def get_all_papers_paginated(self, offset: int, limit: int) -> list[Paper]:
         conn = self._conn_required()

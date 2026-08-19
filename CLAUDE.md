@@ -42,6 +42,7 @@ py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import 
 ```
 
 **Runtime data dir:** `%LOCALAPPDATA%\PaperBase\PaperBase\` — `paperbase.db`, `index/`, `settings.json`.
+`PAPERBASE_DATA_DIR` overrides it (must be an absolute path, else `SystemExit`); `tools/make_fixture.py` builds a throwaway one to test against.
 `import_state.json` and `categorisation_state.json` live at `{library_root}/` (alongside PDFs, not in app data dir).
 
 ---
@@ -191,6 +192,8 @@ Query syntax: `"exact phrase"`, `field:term` (fields: title, abstract, authors, 
 
 Results uncapped (`searcher.num_docs` as limit). Scores normalised 0–100 against top hit; blank column when no query is active.
 
+**An empty index must never reach `searcher.search`:** tantivy's top-score collector asserts its limit is non-zero and a limit of 0 raises a Rust panic that takes the process down. `Indexer.search` returns `[]` when `num_docs == 0`, which is the ordinary first-run state.
+
 **Wildcards (`*`):** Tantivy's `parse_query` has no native wildcard support — it silently drops `*` from terms. Any query containing `*` is instead routed through `Indexer._parse_wildcard_query`/`_build_clause_query` (`core/indexer.py`), which tokenises the string (respecting quoted phrases and `field:[range]` tokens), converts each `*`-containing clause to an anchored regex via `tantivy.Query.regex_query`, and recombines clauses with `tantivy.Query.boolean_query` using the same `AND`/`OR`/`NOT`/`+`/`-` semantics. Queries without `*` are unaffected — they still go straight through `parse_query`.
 
 All text fields use the `en_stem` tokenizer, so `regex_query` matches against **stemmed, lowercased** terms, not the raw word. Trailing wildcards (`word*`) are reliable since stemming only ever removes a suffix — a literal prefix always still matches. Leading/infix wildcards (`*word`, `wo*rd`) are correctly implemented but can miss matches where the wildcard's fixed text spans a suffix the stemmer would otherwise strip (e.g. `*genesis` won't match "biogenesis", because `en_stem` indexes it as `biogenesi`). This is a property of the stemmed index, not a parser bug — do not try to "fix" it by switching tokenizers.
@@ -269,7 +272,11 @@ Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land
 
 **Rate limiting:** Crossref min 20ms (`RateLimiter` with `asyncio.Lock`). Unpaywall min 100ms.
 
-**Resume state:** Progress persisted to `{library_root}/import_state.json` every 100 papers. UI shows total/processed/succeeded/needs\_review/failed and running ETA. User can pause/resume at any time; app remains fully usable during import.
+**Counters:** the worker holds `done == imported + dupes + failed + skipped`, and `ImportDialog` labels them so they visibly sum. `needs_review` is a subset of `imported`, never a separate bucket. ETA divides by `worked` (items this run did real work for), not by `done`, or resumed items collapse the estimate.
+
+**Index commits are batched** every `INDEX_COMMIT_INTERVAL` (200) documents plus once at the end. A Tantivy commit is an fsync and a new segment; never call `commit()` per document.
+
+**Resume state:** `{library_root}/import_state.json` is append-only, one JSON string per line, written per item (`_append_state`). A legacy `{"processed": [...]}` object is still read and collapsed once via `_rewrite_state`. Do not go back to rewriting the whole set: at 150k items that was tens of GB of bookkeeping writes. UI shows total/processed/succeeded/needs\_review/failed and running ETA. User can pause/resume at any time; app remains fully usable during import.
 
 ---
 
@@ -286,40 +293,76 @@ Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land
 
 ## UI Layout
 
+Three rows of floating `GlassPanel`s on a `CanvasBackdrop`, 20px window margin and 20px
+between rows, with the splitter handle at the same 20px so the black reads as one field.
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  [Search bar ................................] [Import] [⚙]  │
-├──────────────┬──────────────────────────────┬───────────────┤
-│ Collections  │ Results (QTableView)         │ Paper Detail  │
-│ (QTreeView)  │ Title | Authors | Jnl | Year │               │
-│              │ ...                          │ [Editable     │
-│ Tags         │ ...                          │  metadata     │
-│ (flat list)  │ ...                          │  fields]      │
-│              │                              │               │
-│              │                              │ [Open PDF]    │
-└──────────────┴──────────────────────────────┴───────────────┘
-│ Status bar: 130,421 papers | 12 needs review | Index: ready │
-└─────────────────────────────────────────────────────────────┘
+╭─────────────────────────────────────────────────────────────╮
+│  [Search .......................] [Search] [Import] [Categorise] [Settings]
+╰─────────────────────────────────────────────────────────────╯
+╭────────────╮ ╭──────────────────────────────╮ ╭────────────╮
+│ Library    │ │ Papers            2,000 papers│ │ Paper      │
+│ (lime)     │ │ (cyan)                        │ │ (magenta)  │
+│ Collections│ │ Filters │ Title Authors Jnl Yr│ │ Identity   │
+│ Tags       │ │         │ Score               │ │ Publication│
+│            │ │                               │ │ Identifiers│
+│            │ │                               │ │ [Open PDF] │
+╰────────────╯ ╰──────────────────────────────╯ ╰────────────╯
+╭─────────────────────────────────────────────────────────────╮
+│ 130,421 papers · 12 need review · index 130,000             │
+╰─────────────────────────────────────────────────────────────╯
 ```
 
+Splitter stretch factors 1:4:2. The panel title carries the region accent; the results count
+sits in the Papers panel's header slot via `GlassPanel.add_header_widget`.
+
 - Authors field: comma-separated display, split on save into JSON array. No autocomplete, no lookup table.
-- Tags: clickable chips, removed by clicking; `QLineEdit` below to add.
+- Tags: clickable chips (`QPushButton#TagChip`), removed by clicking; `QLineEdit` below to add.
 - Changes saved on `editingFinished` (focus-out or Enter) — single `UPDATE`, no debounce.
 - Deleting a collection removes its ID from all `papers.collection_ids` arrays; does not delete papers.
+- `needs_review` is shown as an amber chip plus an amber left border on the four fields the
+  guessing pipeline fills (title, authors, journal, year), never as a banner.
+- The results panel is a `QStackedWidget`: table, loading, empty library, no query match, no
+  filter match. Every absence is a designed `EmptyState`, not a blank grid.
 
 ---
 
 ## UI Theme
 
-All visual styling lives in `paperbase/ui/theme.py`. `apply_theme(app)` is called in `main.py`
-immediately after `QApplication()`. The colour palette is documented in comments at the top of
-that file.
+Deep black canvas, translucent glass panels floating as islands with canvas visible between
+them, one accent hue per region. Tokens live as module constants in `paperbase/ui/theme.py`;
+`apply_theme(app)` is called in `main.py` immediately after `QApplication()` and sets
+`Fusion` before the sheet (the native Windows style ignores parts of it).
 
-- Never hardcode colours in widget files; use object-name selectors or reference palette values.
-- Inline `setStyleSheet` on individual widgets is only acceptable for state-specific overrides
-  (e.g. TagChip hover, review badge) that cannot be expressed via global selectors.
-- Primary-action buttons get `setObjectName("primary")` to activate the orange accent style.
-- Accent colour: `#F26822` (orange). Root bg: `#0D0D0D`. Surface: `#0D1B2A` (deep dark blue). Raised: `#163046`. TEXT_DIM: `#6888A0`.
+| Token | Value | Owns |
+|---|---|---|
+| `CANVAS` / `CANVAS_DEEP` / `ANCHOR` | `#0A0A0C` / `#060608` / `#1A1046` | ground, gradient far end, glow base |
+| `ACCENT_CYAN` | `#22E1FF` | results/search, primary action, focus, selection |
+| `ACCENT_LIME` | `#8FE84A` | collections/tags, categorisation, success |
+| `ACCENT_MAGENTA` | `#FF5CB0` | paper detail, tag chips |
+| `ACCENT_AMBER` | `#FFB03A` | import, needs-review |
+| `ACCENT_RED` | `#FF5A5A` | destructive, errors |
+| `TEXT_PRIMARY` / `TEXT_SECONDARY` / `TEXT_ON_ACCENT` | `#EDEDF2` / `#B9BAC7` / `#0A0A0C` | |
+| `SPACE` 8, `RADIUS_PANEL` 14, `RADIUS_CONTROL` 8, `RADIUS_INPUT` 6 | | 3u between panels, 2u panel padding, 1u inside a group |
+| `MOTION_HOVER` 140, `MOTION_BASE` 220, `MOTION_CELEBRATE` 600 | ms | |
+
+`paperbase/ui/glass.py` holds the primitives, since Qt has no backdrop blur and no
+`box-shadow`: `CanvasBackdrop` (window ground), `GlassPanel` (the floating island, with
+`header_layout` / `content_layout` and a region `accent`), `panel_shadow`, `accent_glow`,
+`StackFader`, `EmptyState`, `display_font`.
+
+- Never hardcode colours in widget files; use object-name selectors or `theme` constants.
+- Panels are styled by object name (`#GlassPanel`), never by class. `chrome=True` selects the
+  heavier `PANEL_FILL_HI` fill for the command bar and dialog control strips.
+- `QWidget` carries `CANVAS` as the global base. Never set the `QWidget` base to a panel
+  colour: it paints every anonymous layout container and destroys the floating-island layout.
+- Inline `setStyleSheet` on individual widgets is only for state-specific overrides that
+  cannot be expressed via global selectors.
+- Primary-action buttons get `setObjectName("primary")` (cyan fill); `#danger` fills red.
+- `theme.reduced_motion()` gates every animation. `PAPERBASE_REDUCED_MOTION`
+  (`1`/`true`/`yes`) overrides the `reduce_motion` setting in either direction; the setting
+  reaches it via `theme.set_reduced_motion`, called from `main.main` and
+  `SettingsDialog._accept`.
 
 ---
 
@@ -358,7 +401,11 @@ that file.
 
 ## Implementation Gotchas
 
-**PaperTableModel columns** (`ui/search_panel.py`): adding a column requires `_COLUMNS`, `data()`, and `sort()`. Scores live in `_scores: dict[int, float]` on the model, not on `Paper`.
+**PaperTableModel is id-backed** (`ui/search_panel.py`): it holds `_ids: list[int]` and an LRU `_cache` of at most `CACHE_LIMIT` papers, fetching a `BLOCK` of 200 rows from SQLite as the view asks for them. Never materialise the whole result set. Adding a column requires `_COLUMNS`, `_SORT_KEYS` (column index → `search_filter` sort key), and `data()`. `sort()` does not sort: it emits `sort_requested`, and `SearchPanel._apply_filters` re-runs the query with an `ORDER BY`. Scores live in `_scores: dict[int, float]` on the model, not on `Paper`.
+
+**Sort indicator must be synced by hand:** `setSortingEnabled(True)` makes Qt call `model.sort()` during construction, leaving an arrow on Title while the rows are in `date_added` order. `SearchPanel._sync_sort_indicator` corrects it and blocks header signals, since `setSortIndicator` re-enters `sortByColumn`.
+
+**`QItemSelectionModel::reset()` clears the selection without emitting anything**, so `currentRowChanged` does not fire on a model reset and the detail panel would keep showing a paper the results no longer list. `_apply_filters` emits `paper_selected(None)` after `set_ids` for that reason.
 
 **Async unbound local:** Always initialise `paper = None` before `if doi: paper = await resolve_metadata(...)`. Python raises `UnboundLocalError` on the fallback if `doi` was falsy and the branch never executed.
 
@@ -366,11 +413,17 @@ that file.
 
 **`place_file` call sites:** Exactly 5 in `importer.py` (`_import_pdf`, `_import_doi`, `_import_direct_pdf_url`, two in `_import_landing_page`). Post-placement hooks and `_apply_categorisation` must be added at all 5. `_apply_categorisation` is called immediately after `paper.id = paper_id` at all 5 `insert_paper` sites.
 
+**Nothing heavy before the first paint:** `MainWindow.__init__` only builds widgets. `main.py` calls `window.show()` then `window.start_deferred_load()`, which stages the listing, the collection tree, and the categoriser preload behind `QTimer.singleShot`. `CollectionTree.__init__` deliberately does not call `refresh()`. `SearchPanel._apply_filters` returns early until `_loaded`, or the sort Qt triggers during construction runs a full-library query before the window is up.
+
+**A `QScrollArea` with the horizontal bar off clips instead of scrolling.** In `PaperDetail` the tag chips are one `QHBoxLayout` (Qt has no flow layout), so their width would otherwise become the whole form's minimum and silently cut the right-hand edge off every field. `_tags_container.setMinimumWidth(1)` makes the chips give first. Watch for this with any unbounded row added to that form.
+
+**Table columns must add up:** the results table's Title column is `QHeaderView.ResizeMode.Stretch` and the other four are fixed, so the five always fit the panel. Fixed widths for all five overflowed and pushed Year and Score out of sight.
+
 **Dialog cache invalidation:** `_open_settings` nulls `_import_dialog` and `_cat_dialog` — intentional. Both cache categoriser settings at construction; must be recreated after settings change. Do not add lazy-init guards that skip this reset.
 
-**SQLite variable limit:** Chunk `IN (?,?...)` at ≤900 items (`SQLITE_MAX_VARIABLE_NUMBER` = 999 on older builds). `get_papers_by_ids` already does this; do not add new unbounded IN clauses. `search_filter` takes `paper_ids=None` (no pre-filter, query all) vs `paper_ids=[]` (no results — distinct case).
+**SQLite variable limit:** Chunk `IN (?,?...)` at ≤900 items (`SQLITE_MAX_VARIABLE_NUMBER` = 999 on older builds). `get_papers_by_ids` already does this; do not add new unbounded IN clauses. `search_filter` instead loads its candidate ids into the per-connection `temp.search_ids` table (created in `open()`) and joins against it, which has no variable limit and lets SQLite do the ordering. `search_filter` takes `paper_ids=None` (no pre-filter, query all) vs `paper_ids=[]` (no results — distinct case).
 
-**Tag/collection filter:** Calls `get_paper(pid)` individually per ID — acceptable for ≤500 Tantivy results, slow for `paper_ids=None` on large result sets. Known limitation; do not "fix" with an unbounded IN clause.
+**Tag/collection filter:** handled inside SQLite by `EXISTS (SELECT 1 FROM json_each(p.tags) …)`, not in Python. `get_all_tags` uses `json_each` for the same reason. Do not reintroduce a per-id `get_paper` loop.
 
 **fitz context manager:** `fitz.Document` supports `with fitz.open(str(path)) as doc:` (PyMuPDF >= 1.18; project requires >= 1.24). Prefer this over manual `.close()` — bare `.close()` inside a `try` without `finally` leaks on exception.
 

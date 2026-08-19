@@ -2,18 +2,20 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-    QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
 
 from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
 from paperbase.models.paper import Paper
+from paperbase.ui import theme
 from paperbase.ui.categorisation_dialog import CategorizationDialog
 from paperbase.ui.collection_tree import CollectionTree
+from paperbase.ui.glass import CanvasBackdrop, GlassPanel
 from paperbase.ui.import_dialog import ImportDialog
 from paperbase.ui.paper_detail import PaperDetail
 from paperbase.ui.search_panel import SearchPanel
@@ -43,55 +45,87 @@ class MainWindow(QMainWindow):
             threshold=settings.category_threshold,
             tag_count=settings.tag_count,
         )
-        # Preload the model in the background so it's ready for new imports.
-        if settings.auto_categorise and settings.categories:
-            threading.Thread(target=self._categoriser.load_model, daemon=True).start()
-
         self.setWindowTitle("PaperBase")
         self.setMinimumSize(1100, 680)
         self._build_ui()
+
+    def start_deferred_load(self) -> None:
+        """Everything that is not needed to paint the first frame.
+
+        Called by main.py after show(). Ordered by how soon the user needs it: the list,
+        then the sidebar, then the embedding model, which is only needed once an import
+        starts and costs seconds of CPU and disk to load.
+        """
+        QTimer.singleShot(0, self._populate_initial)
+        QTimer.singleShot(120, self._collection_tree.refresh)
+        QTimer.singleShot(2000, self._preload_categoriser)
+
+    def _populate_initial(self) -> None:
+        self._search_panel.run_search("")
+        self._search_panel.refresh_tags()
         self._refresh_status()
 
+    def _preload_categoriser(self) -> None:
+        if self._settings.auto_categorise and self._settings.categories:
+            threading.Thread(target=self._categoriser.load_model, daemon=True).start()
+
     def _build_ui(self) -> None:
-        # ---- Toolbar ----
-        toolbar = QToolBar()
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+        """Three rows of floating glass on a painted canvas: commands, work, status.
+
+        Nothing is flush with anything. The 20px window margin and the 20px row gap are
+        the same measure as the splitter's handle width, so the black between the panels
+        reads as one continuous field showing through rather than as gutters.
+        """
+        central = CanvasBackdrop()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(20)
+
+        # ---- Command bar: chrome glass, every control visible, no overflow menu ----
+        command_bar = GlassPanel(chrome=True)
+        command_bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        commands = QHBoxLayout()
+        commands.setContentsMargins(0, 0, 0, 0)
+        commands.setSpacing(theme.SPACE)
 
         self._search_bar = QLineEdit()
         self._search_bar.setPlaceholderText("Search papers…")
         self._search_bar.setMinimumWidth(400)
         self._search_bar.returnPressed.connect(self._run_search)
-        toolbar.addWidget(self._search_bar)
+        commands.addWidget(self._search_bar, 1)
 
         search_btn = QPushButton("Search")
         search_btn.clicked.connect(self._run_search)
-        toolbar.addWidget(search_btn)
+        commands.addWidget(search_btn)
 
-        toolbar.addSeparator()
+        # Two groups, held apart by space rather than by the old separator rule: the
+        # query on the left, the library actions on the right.
+        commands.addSpacing(theme.SPACE * 2)
 
         import_btn = QPushButton("Import")
         import_btn.setObjectName("primary")
         import_btn.clicked.connect(self._open_import)
-        toolbar.addWidget(import_btn)
+        commands.addWidget(import_btn)
 
         categorise_btn = QPushButton("Categorise")
         categorise_btn.setToolTip("Auto-categorise and tag all papers using text embeddings")
         categorise_btn.clicked.connect(self._open_categorise)
-        toolbar.addWidget(categorise_btn)
+        commands.addWidget(categorise_btn)
 
-        settings_btn = QPushButton("⚙")
-        settings_btn.setToolTip("Settings")
+        # Spelled out rather than a gear glyph: Tahoma has no U+2699, and the fallback
+        # draws it small enough to read as an empty button.
+        settings_btn = QPushButton("Settings")
         settings_btn.clicked.connect(self._open_settings)
-        toolbar.addWidget(settings_btn)
+        commands.addWidget(settings_btn)
 
-        # ---- Central splitter ----
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        command_bar.content_layout.addLayout(commands)
+        main_layout.addWidget(command_bar)
 
+        # ---- The work: three islands, one accent each, canvas between them ----
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(20)
+        splitter.setChildrenCollapsible(False)
 
         # Left: collection tree
         self._collection_tree = CollectionTree(self._db)
@@ -99,31 +133,51 @@ class MainWindow(QMainWindow):
         self._collection_tree.collection_selected.connect(self._on_collection_selected)
         self._collection_tree.tag_selected.connect(self._on_tag_selected)
         self._collection_tree.papers_added_to_collection.connect(self._on_papers_added_to_collection)
-        splitter.addWidget(self._collection_tree)
+        library_panel = GlassPanel("Library", accent=theme.ACCENT_LIME)
+        library_panel.set_content(self._collection_tree)
+        splitter.addWidget(library_panel)
 
         # Centre: search + results
         self._search_panel = SearchPanel(self._db, self._indexer)
         self._search_panel.paper_selected.connect(self._on_paper_selected)
         self._search_panel.paper_deleted.connect(self._on_paper_deleted)
-        splitter.addWidget(self._search_panel)
+        self._search_panel.import_requested.connect(self._open_import)
+        papers_panel = GlassPanel("Papers", accent=theme.ACCENT_CYAN)
+        # The count belongs to the panel's header, opposite its title: it describes the
+        # whole panel, and putting it above the table would cost a row of the results.
+        papers_panel.add_header_widget(self._search_panel.count_label)
+        papers_panel.set_content(self._search_panel)
+        splitter.addWidget(papers_panel)
 
         # Right: detail panel
         self._detail_panel = PaperDetail(self._db, user_email=self._settings.user_email)
         self._detail_panel.paper_changed.connect(self._on_paper_changed)
         self._detail_panel.setMinimumWidth(260)
-        splitter.addWidget(self._detail_panel)
+        paper_panel = GlassPanel("Paper", accent=theme.ACCENT_MAGENTA)
+        paper_panel.set_content(self._detail_panel)
+        splitter.addWidget(paper_panel)
 
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 4)
         splitter.setStretchFactor(2, 2)
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(splitter, 1)
 
-        # ---- Status bar ----
-        self._status_bar = QStatusBar()
-        self.setStatusBar(self._status_bar)
+        # ---- Status strip: an island too, and a slim one ----
+        self._status_panel = GlassPanel()
+        self._status_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        # Half the vertical padding of a working panel: this is a strip carrying one
+        # line, and a full 2u pad above and below it would read as an empty surface.
+        self._status_panel.layout().setContentsMargins(
+            theme.SPACE * 2, theme.SPACE, theme.SPACE * 2, theme.SPACE
+        )
 
-        # Show all papers on startup
-        self._search_panel.run_search("")
+        self._status_label = QLabel()
+        self._status_label.setTextFormat(Qt.TextFormat.RichText)
+        self._status_label.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; background: transparent;"
+        )
+        self._status_panel.content_layout.addWidget(self._status_label)
+        main_layout.addWidget(self._status_panel)
 
     # ------------------------------------------------------------------
 
@@ -211,8 +265,7 @@ class MainWindow(QMainWindow):
                 tag_count=self._settings.tag_count,
             )
             # If categories were just configured for the first time, preload the model.
-            if self._settings.auto_categorise and self._settings.categories:
-                threading.Thread(target=self._categoriser.load_model, daemon=True).start()
+            self._preload_categoriser()
             # ImportDialog is cached; invalidate it so it picks up the new categoriser state.
             self._import_dialog = None
             self._cat_dialog = None
@@ -222,8 +275,16 @@ class MainWindow(QMainWindow):
         total = self._db.get_paper_count()
         review = self._db.get_needs_review_count()
         idx_docs = self._indexer.document_count()
-        self._status_bar.showMessage(
-            f"{total:,} papers  |  {review} needs review  |  Index: {idx_docs:,} docs"
+        # Rich text, so the separators' air has to be non-breaking: HTML collapses a run
+        # of ordinary spaces and the three figures would run together.
+        gap = "&nbsp;&nbsp;&nbsp;·&nbsp;&nbsp;&nbsp;"
+        needs_review = f"{review:,} need review"
+        if review > 0:
+            # Amber is the needs-review hue everywhere in the application. The count and
+            # the word carry the same information for anyone who cannot read the colour.
+            needs_review = f'<span style="color: {theme.ACCENT_AMBER};">{needs_review}</span>'
+        self._status_label.setText(
+            f"{total:,} papers{gap}{needs_review}{gap}index {idx_docs:,}"
         )
 
     @pyqtSlot()

@@ -38,7 +38,7 @@ from paperbase.models.paper import Paper
 
 logger = logging.getLogger(__name__)
 
-STATE_SAVE_INTERVAL = 100   # save progress every N papers
+INDEX_COMMIT_INTERVAL = 200   # Tantivy commits are fsyncs; batch them
 
 
 def _now_iso() -> str:
@@ -121,16 +121,23 @@ class ImportWorker(QThread):
     async def _run_async(self) -> None:
         rate_limiter = RateLimiter()
         processed = self._load_state()
+        if processed:
+            # Collapse a legacy whole-set state file into the append-only format once.
+            self._rewrite_state(processed)
 
         total = len(self._items)
-        done = len(processed)
-        succeeded = 0
+        # Invariant held from here on: done == imported + dupes + failed + skipped.
+        done = 0
+        skipped = 0
+        imported = 0
         review_count = 0
         failed = 0
         dupes = 0
+        worked = 0                      # items this run actually did network/disk work for
+        pending_index = 0               # documents added since the last Tantivy commit
         start_time = time.monotonic()
 
-        for idx, item in enumerate(self._items):
+        for item in self._items:
             if self._stop_requested:
                 break
 
@@ -138,7 +145,9 @@ class ImportWorker(QThread):
                 await asyncio.sleep(0.5)
 
             if item in processed:
+                skipped += 1
                 done += 1
+                self.progress.emit(done, total, imported, review_count, failed, dupes)
                 continue
 
             self.item_started.emit(item)
@@ -153,40 +162,49 @@ class ImportWorker(QThread):
             except Exception as e:
                 logger.exception("Unexpected error importing %s", item)
                 self.item_failed.emit(item, str(e))
-                failed += 1
                 ok, nr, is_dupe = False, False, False
 
-            if ok:
-                if is_dupe:
-                    dupes += 1
-                else:
-                    succeeded += 1
-                    if nr:
-                        review_count += 1
+            if ok and is_dupe:
+                dupes += 1
+            elif ok:
+                imported += 1
+                pending_index += 1
+                if nr:
+                    review_count += 1
             else:
                 failed += 1
 
             processed.add(item)
+            self._append_state(item)
             done += 1
+            worked += 1
 
-            elapsed = time.monotonic() - start_time
+            if pending_index >= INDEX_COMMIT_INTERVAL:
+                self._indexer.commit()
+                pending_index = 0
+
+            # Rate is measured over items this run did real work for; items skipped on
+            # resume complete instantly and would otherwise collapse the estimate.
             eta_str = ""
-            if done > 0:
-                avg = elapsed / done
-                remaining = avg * (total - done)
-                m, s = divmod(int(remaining), 60)
-                eta_str = f" | ETA {m}m {s}s" if remaining > 0 else ""
+            if worked > 0:
+                avg = (time.monotonic() - start_time) / worked
+                remaining = avg * max(total - done, 0)
+                if remaining > 0:
+                    m, s = divmod(int(remaining), 60)
+                    eta_str = f" | ETA {m}m {s}s"
 
-            self.progress.emit(done, total, succeeded, review_count, failed, dupes)
+            self.progress.emit(done, total, imported, review_count, failed, dupes)
             self.log_message.emit(
                 f"[{done}/{total}] {Path(item).name if self._mode == 'pdfs' else item}"
                 f"{eta_str}"
             )
 
-            if done % STATE_SAVE_INTERVAL == 0:
-                self._save_state(processed)
-
-        self._save_state(processed)
+        if pending_index:
+            self._indexer.commit()
+        if skipped:
+            self.log_message.emit(
+                f"Skipped {skipped} already-processed item(s) from a previous run."
+            )
 
     # ------------------------------------------------------------------
     # Mode 1: local PDFs
@@ -224,7 +242,6 @@ class ImportWorker(QThread):
         paper.id = paper_id
         self._apply_categorisation(paper)
         self._indexer.add_document(paper, fulltext)
-        self._indexer.commit()
 
         self.item_finished.emit(str(path), True, paper.needs_review)
         return True, paper.needs_review, False
@@ -258,7 +275,6 @@ class ImportWorker(QThread):
         paper.id = paper_id
         self._apply_categorisation(paper)
         self._indexer.add_document(paper, fulltext)
-        self._indexer.commit()
 
         self.item_finished.emit(doi, True, paper.needs_review)
         return True, paper.needs_review, False
@@ -309,7 +325,6 @@ class ImportWorker(QThread):
         paper.id = paper_id
         self._apply_categorisation(paper)
         self._indexer.add_document(paper, fulltext)
-        self._indexer.commit()
 
         self.item_finished.emit(url, True, paper.needs_review)
         return True, paper.needs_review, False
@@ -357,7 +372,6 @@ class ImportWorker(QThread):
                 paper.id = paper_id
                 self._apply_categorisation(paper)
                 self._indexer.add_document(paper, fulltext)
-                self._indexer.commit()
                 self.item_finished.emit(url, True, paper.needs_review)
                 return True, paper.needs_review, False
             # Fall through to Unpaywall
@@ -378,7 +392,6 @@ class ImportWorker(QThread):
                 paper.id = paper_id
                 self._apply_categorisation(paper)
                 self._indexer.add_document(paper, fulltext)
-                self._indexer.commit()
                 self.item_finished.emit(url, True, paper.needs_review)
                 return True, paper.needs_review, False
 
@@ -393,20 +406,55 @@ class ImportWorker(QThread):
     # ------------------------------------------------------------------
 
     def _load_state(self) -> set[str]:
-        if self._state_file and self._state_file.exists():
-            try:
-                data = json.loads(self._state_file.read_text(encoding="utf-8"))
-                return set(data.get("processed", []))
-            except Exception:
-                pass
-        return set()
+        """Read the processed set from the append-only state file.
 
-    def _save_state(self, processed: set[str]) -> None:
-        if self._state_file:
+        Accepts the legacy {"processed": [...]} JSON object written by earlier versions so
+        an interrupted import started on the old format still resumes.
+        """
+        if not self._state_file or not self._state_file.exists():
+            return set()
+        try:
+            raw = self._state_file.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to read import state: %s", e)
+            return set()
+
+        stripped = raw.lstrip()
+        if stripped.startswith("{"):
             try:
-                self._state_file.write_text(
-                    json.dumps({"processed": list(processed)}, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception as e:
-                logger.warning("Failed to save import state: %s", e)
+                return set(json.loads(raw).get("processed", []))
+            except (ValueError, AttributeError):
+                logger.warning("Import state file is corrupt; starting from empty")
+                return set()
+
+        processed: set[str] = set()
+        for line in raw.splitlines():
+            if line:
+                try:
+                    processed.add(json.loads(line))
+                except ValueError:
+                    continue  # torn final line from a hard kill
+        return processed
+
+    def _append_state(self, item: str) -> None:
+        """Append one processed item. O(1) per call, unlike a whole-set rewrite."""
+        if not self._state_file:
+            return
+        try:
+            with self._state_file.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.warning("Failed to append import state: %s", e)
+
+    def _rewrite_state(self, processed: set[str]) -> None:
+        """Rewrite the state file from scratch. Called once when an old-format file is
+        loaded, so the append path is safe from then on."""
+        if not self._state_file:
+            return
+        try:
+            self._state_file.write_text(
+                "".join(json.dumps(i, ensure_ascii=False) + "\n" for i in sorted(processed)),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.warning("Failed to rewrite import state: %s", e)

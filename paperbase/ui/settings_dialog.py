@@ -5,9 +5,12 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+from paperbase.ui import theme
+from paperbase.ui.glass import CanvasBackdrop, GlassPanel
 
 SETTINGS_VERSION = 2
 
@@ -24,6 +27,8 @@ class Settings:
         self.auto_categorise: bool = True       # run categoriser on each new import
         self.category_threshold: float = 0.35  # min cosine similarity to assign a category
         self.tag_count: int = 5                # keywords to extract per paper
+        # Appearance
+        self.reduce_motion: bool = False       # collapse every animation to an instant swap
 
     def is_configured(self) -> bool:
         return bool(self.library_root and self.user_email)
@@ -40,6 +45,7 @@ class Settings:
             "auto_categorise": self.auto_categorise,
             "category_threshold": self.category_threshold,
             "tag_count": self.tag_count,
+            "reduce_motion": self.reduce_motion,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -58,6 +64,7 @@ class Settings:
                 s.auto_categorise = data.get("auto_categorise", True)
                 s.category_threshold = float(data.get("category_threshold", 0.35))
                 s.tag_count = int(data.get("tag_count", 5))
+                s.reduce_motion = bool(data.get("reduce_motion", False))
             except Exception:
                 pass
         return s
@@ -72,20 +79,40 @@ class SettingsDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        outer = QVBoxLayout(self)
+        """Glass groups floating on the canvas, the same measure as the main window.
+
+        The 20px margin and 20px gap are what the window uses between its own panels, so
+        a dialog opening over it reads as another island on the same field rather than as
+        a box pasted on top.
+        """
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        backdrop = CanvasBackdrop(self)
+        root.addWidget(backdrop)
+
+        outer = QVBoxLayout(backdrop)
+        outer.setContentsMargins(20, 20, 20, 20)
+        outer.setSpacing(20)
 
         # Wrap everything in a scroll area so the dialog stays usable at low resolutions.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(scroll.Shape.NoFrame)
+        scroll.viewport().setAutoFillBackground(False)
         inner = QWidget()
         layout = QVBoxLayout(inner)
+        # A hair of top margin: the first group's title lives in the box's own margin
+        # band, and flush against the viewport edge it reads as cropped even when it is not.
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(20)
         scroll.setWidget(inner)
-        outer.addWidget(scroll)
+        outer.addWidget(scroll, 1)
 
         # ---- General settings ----
         general_box = QGroupBox("General")
         form = QFormLayout(general_box)
+        form.setVerticalSpacing(theme.SPACE)
+        form.setHorizontalSpacing(theme.SPACE * 2)
 
         root_row = QWidget()
         root_hl = QHBoxLayout(root_row)
@@ -122,16 +149,23 @@ class SettingsDialog(QDialog):
             "Pattern tokens: {journal} {year} {author} {title}\n"
             "Unresolved tokens are replaced with 'Unknown' or 'Unsorted'."
         )
-        pattern_note.setStyleSheet("color: #6888A0; font-size: 8pt;")
+        pattern_note.setObjectName("FieldNote")
+        pattern_note.setWordWrap(True)
         form.addRow("", pattern_note)
 
         layout.addWidget(general_box)
 
         # ---- Auto-categorisation settings ----
+        # Lime, because this group configures the categoriser, and the categoriser owns
+        # lime everywhere it appears: the Library panel it writes into and its own dialog.
         cat_box = QGroupBox("Auto-Categorisation")
+        cat_box.setProperty("accent", "lime")
         cat_layout = QVBoxLayout(cat_box)
+        cat_layout.setSpacing(theme.SPACE * 2)
 
         cat_form = QFormLayout()
+        cat_form.setVerticalSpacing(theme.SPACE)
+        cat_form.setHorizontalSpacing(theme.SPACE * 2)
 
         self._auto_cat_check = QCheckBox("Run on each new import")
         self._auto_cat_check.setChecked(self._settings.auto_categorise)
@@ -162,7 +196,7 @@ class SettingsDialog(QDialog):
             "to calibrate the embedding; richer descriptions improve accuracy."
         )
         cat_label.setWordWrap(True)
-        cat_label.setStyleSheet("color: #6888A0; font-size: 8pt;")
+        cat_label.setObjectName("FieldNote")
         cat_layout.addWidget(cat_label)
 
         self._cat_table = QTableWidget(0, 2)
@@ -195,13 +229,41 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(cat_box)
 
-        # ---- Dialog buttons ----
+        # ---- Appearance ----
+        appearance_box = QGroupBox("Appearance")
+        app_form = QFormLayout(appearance_box)
+        app_form.setVerticalSpacing(theme.SPACE)
+        app_form.setHorizontalSpacing(theme.SPACE * 2)
+
+        self._reduce_motion_check = QCheckBox("Reduce motion")
+        self._reduce_motion_check.setChecked(self._settings.reduce_motion)
+        app_form.addRow("Motion:", self._reduce_motion_check)
+
+        motion_note = QLabel(
+            "Panel hover lift and the cross-fade between result states become instant. "
+            "Nothing is hidden by this: every state the motion carries is carried by the "
+            "change itself."
+        )
+        motion_note.setObjectName("FieldNote")
+        motion_note.setWordWrap(True)
+        app_form.addRow("", motion_note)
+
+        layout.addWidget(appearance_box)
+        layout.addStretch(1)
+
+        # ---- Dialog buttons: a chrome strip, matching the window's command bar ----
+        button_bar = GlassPanel(chrome=True)
+        button_bar.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setObjectName("primary")
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
-        outer.addWidget(buttons)
+        button_bar.content_layout.addWidget(buttons)
+        outer.addWidget(button_bar)
 
     # ------------------------------------------------------------------
     # Category table helpers
@@ -253,6 +315,11 @@ class SettingsDialog(QDialog):
         self._settings.auto_categorise = self._auto_cat_check.isChecked()
         self._settings.category_threshold = self._threshold_spin.value()
         self._settings.tag_count = self._tag_count_spin.value()
+        self._settings.reduce_motion = self._reduce_motion_check.isChecked()
+        # Applied here rather than by the caller: every animation in the application asks
+        # theme at the moment it would start, so the box takes effect on OK without a
+        # restart and without a settings object reaching the widgets that animate.
+        theme.set_reduced_motion(self._settings.reduce_motion)
 
         categories: list[dict] = []
         for row in range(self._cat_table.rowCount()):
