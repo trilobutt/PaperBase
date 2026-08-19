@@ -286,6 +286,12 @@ Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land
 - `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and categories non-empty.
 - `categorise_paper()` returns `(collection_ids, tags)` to **merge onto** the paper, never replace. Creates missing top-level collections automatically.
 - Model: `all-MiniLM-L6-v2` (~23 MB, cached in `~/.cache/torch/sentence_transformers/`). Do NOT switch to Qwen3-Embedding-0.6B (27× slower on CPU). Quality upgrade path: `BAAI/bge-small-en-v1.5`.
+- CPU-only by design. Install `torch` from PyPI, whose default Windows wheel is the CPU
+  build. A CUDA build buys nothing on a GTX 1050 Ti: PyTorch dropped Pascal (`sm_61`) from
+  its CUDA 12.8 and 12.9 builds from release 2.8 onward, so a CUDA install fails at runtime
+  with `no kernel image is available for execution on the device`. Embedding a
+  150,000-paper library (title plus abstract, one vector each) is roughly an hour on 4 to 6
+  cores, so the CPU build is sufficient for everything here.
 - Retroactive batch: `CategorizationWorker(QThread)`, state in `{library_root}/categorisation_state.json`.
 - `core/llm.py` is dead code — do not import it.
 
@@ -455,6 +461,7 @@ dependencies = [
     "lxml>=5.0",
     "sentence-transformers>=3.0",
     "keybert>=0.8",
+    "yake>=0.7",
 ]
 
 [project.optional-dependencies]
@@ -462,3 +469,7 @@ dev = ["pyinstaller>=6.0", "pytest>=8.0", "pytest-qt>=4.4"]
 ```
 
 No test suite exists yet. `pytest`/`pytest-qt` are dev placeholders.
+
+`yake` is declared ahead of the keywording code that will use it. It pulls seven transitive
+dependencies (`click`, `colorama`, `jellyfish`, `networkx`, `segtok`, `tabulate`, `regex`),
+all with prebuilt cp312 Windows wheels.

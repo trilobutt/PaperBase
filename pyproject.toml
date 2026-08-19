@@ -18,6 +18,7 @@ dependencies = [
     "lxml>=5.0",
     "sentence-transformers>=3.0",
     "keybert>=0.8",
+    "yake>=0.7",
 ]
 
 [project.optional-dependencies]
