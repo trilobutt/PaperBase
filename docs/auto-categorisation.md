@@ -37,8 +37,6 @@ vector each. That runs on the CPU in about an hour. So:
 - Installing `torch` from PyPI on Windows gives the CPU build by default, which works on any
   machine. The Pascal problem only appears if someone deliberately installs a CUDA build
   expecting the 1050 Ti to help. It will not, and it does not need to.
-- Record this in `CLAUDE.md` so nobody spends a day debugging
-  `no kernel image is available for execution on the device` later.
 
 ---
 
