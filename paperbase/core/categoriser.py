@@ -26,6 +26,21 @@ from paperbase.models.paper import Paper
 logger = logging.getLogger(__name__)
 
 _STATE_SAVE_INTERVAL = 200
+_BATCH_SIZE = 64          # papers per model pass in the retroactive worker
+_ENCODE_BATCH = 64        # sentence-transformers internal batch size
+
+
+def _load_models(name: str):
+    """Import and construct the embedding and keyword models.
+
+    A module-level factory so tests can substitute a fake: neither library is a hard
+    dependency of the rest of the application, and neither is installed on every machine.
+    """
+    from sentence_transformers import SentenceTransformer
+    from keybert import KeyBERT
+
+    model = SentenceTransformer(name)
+    return model, KeyBERT(model=model)
 
 
 class EmbeddingCategoriser:
@@ -55,16 +70,15 @@ class EmbeddingCategoriser:
             if self._model is not None:
                 return
             try:
-                from sentence_transformers import SentenceTransformer
-                from keybert import KeyBERT
+                model, kw_model = _load_models(self.MODEL_NAME)
             except ImportError:
                 logger.error(
                     "sentence-transformers and keybert are required for auto-categorisation. "
                     "Run: pip install sentence-transformers keybert"
                 )
                 return
-            self._model = SentenceTransformer(self.MODEL_NAME)
-            self._kw_model = KeyBERT(model=self._model)
+            self._model = model
+            self._kw_model = kw_model
             if self._categories:
                 self._recompute_embeddings()
             logger.info("Loaded embedding model %s", self.MODEL_NAME)
@@ -92,63 +106,99 @@ class EmbeddingCategoriser:
             self._category_embeddings[cat["name"]] = emb
 
     def categorise_paper(self, paper: Paper, db: Database) -> tuple[list[int], list[str]]:
-        """
-        Returns (collection_ids, tags) to merge onto the paper.
-        Creates any missing top-level collections in the DB.
-        Returns ([], []) if model not loaded or no categories configured.
-        """
-        if self._model is None or not self._categories:
-            return [], []
+        """Single-paper wrapper. Prefer categorise_papers: the model call costs nearly the
+        same for one document as for a batch of 64."""
+        return self.categorise_papers([paper], db)[0]
 
-        text = f"{paper.title} {paper.abstract}".strip()
-        if not text:
-            return [], []
+    def categorise_papers(
+        self, papers: list[Paper], db: Database
+    ) -> list[tuple[list[int], list[str]]]:
+        """Categorise a batch in one model pass.
+
+        Returns one (collection_ids, tags) pair per input paper, positionally, to merge onto
+        that paper. Creates any missing top-level collections. Empty pairs throughout if the
+        model is not loaded or no categories are configured.
+        """
+        empty: list[tuple[list[int], list[str]]] = [([], []) for _ in papers]
+        if self._model is None or not self._categories or not papers:
+            return empty
 
         import numpy as np
 
+        texts = [f"{p.title} {p.abstract}".strip() for p in papers]
+        live = [i for i, t in enumerate(texts) if t]
+        if not live:
+            return empty
+
         with self._lock:
-            doc_emb = self._model.encode(text, normalize_embeddings=True)
+            names = list(self._category_embeddings.keys())
+            if not names:
+                return empty
+            cat_matrix = np.vstack([self._category_embeddings[n] for n in names])
 
-            matched_names: list[str] = []
-            for name, cat_emb in self._category_embeddings.items():
-                sim = float(np.dot(doc_emb, cat_emb))
-                if sim >= self._threshold:
-                    matched_names.append(name)
+            doc_embs = self._model.encode(
+                [texts[i] for i in live],
+                batch_size=_ENCODE_BATCH,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            sims = np.asarray(doc_embs) @ cat_matrix.T          # (live, categories)
+            hits = sims >= self._threshold
 
-            tags: list[str] = []
-            if self._kw_model and paper.abstract:
+            matched: dict[int, list[str]] = {}
+            for row, paper_idx in enumerate(live):
+                matched[paper_idx] = [n for n, hit in zip(names, hits[row]) if hit]
+
+            tags_by_idx: dict[int, list[str]] = {}
+            abstract_idx = [i for i in live if papers[i].abstract]
+            if self._kw_model and abstract_idx:
                 try:
-                    kws = self._kw_model.extract_keywords(
-                        paper.abstract,
+                    raw = self._kw_model.extract_keywords(
+                        [papers[i].abstract for i in abstract_idx],
                         keyphrase_ngram_range=(1, 2),
                         stop_words="english",
                         use_mmr=True,
                         diversity=0.5,
                         top_n=self._tag_count,
                     )
-                    tags = [kw for kw, _score in kws]
+                    # KeyBERT returns a flat list for a single document and a list of lists
+                    # for several; normalise before zipping.
+                    if raw and isinstance(raw[0], tuple):
+                        raw = [raw]
+                    for paper_idx, kws in zip(abstract_idx, raw):
+                        tags_by_idx[paper_idx] = [kw for kw, _score in kws]
                 except Exception as e:
-                    logger.warning("Keyword extraction failed for paper %s: %s", paper.id, e)
+                    logger.warning("Keyword extraction failed for a batch of %d: %s",
+                                   len(abstract_idx), e)
 
-        # DB operations outside the lock to avoid holding it longer than needed.
-        col_ids: list[int] = []
-        for name in matched_names:
-            col_id = _get_or_create_collection(name, db)
-            if col_id is not None:
-                col_ids.append(col_id)
+        # DB work outside the lock, and once for the whole batch rather than once per paper.
+        wanted = {n for ns in matched.values() for n in ns}
+        col_by_name = _resolve_collections(wanted, db)
 
-        return col_ids, tags
+        results: list[tuple[list[int], list[str]]] = []
+        for i in range(len(papers)):
+            col_ids = [col_by_name[n] for n in matched.get(i, []) if n in col_by_name]
+            results.append((col_ids, tags_by_idx.get(i, [])))
+        return results
 
 
-def _get_or_create_collection(name: str, db: Database) -> Optional[int]:
-    for col in db.get_collections():
-        if col.name == name and col.parent_id is None:
-            return col.id
-    try:
-        return db.insert_collection(Collection(id=None, name=name, parent_id=None))
-    except Exception as e:
-        logger.error("Failed to create collection '%s': %s", name, e)
-        return None
+def _resolve_collections(names: set[str], db: Database) -> dict[str, int]:
+    """Map top-level collection names to ids, creating any that are missing.
+
+    One `get_collections()` for the whole batch: the per-paper version read the entire
+    collections table once per matched category.
+    """
+    existing = {c.name: c.id for c in db.get_collections() if c.parent_id is None}
+    resolved: dict[str, int] = {}
+    for name in names:
+        if name in existing:
+            resolved[name] = existing[name]  # type: ignore[assignment]
+            continue
+        try:
+            resolved[name] = db.insert_collection(Collection(id=None, name=name, parent_id=None))
+        except Exception as e:
+            logger.error("Failed to create collection '%s': %s", name, e)
+    return resolved
 
 
 class CategorizationWorker(QThread):
@@ -201,9 +251,11 @@ class CategorizationWorker(QThread):
         processed = self._load_state()
         all_ids = self._db.get_all_paper_ids()
         total = len(all_ids)
-        done = 0
+        pending = [pid for pid in all_ids if pid not in processed]
+        done = total - len(pending)
+        self.progress.emit(done, total)
 
-        for paper_id in all_ids:
+        for start in range(0, len(pending), _BATCH_SIZE):
             if self._stop_requested:
                 self.log_message.emit("Stopped by user.")
                 break
@@ -211,34 +263,26 @@ class CategorizationWorker(QThread):
             while self._pause_requested:
                 time.sleep(0.2)
 
-            if paper_id in processed:
-                done += 1
-                self.progress.emit(done, total)
-                continue
-
-            paper = self._db.get_paper(paper_id)
-            if paper is None:
-                processed.add(paper_id)
-                done += 1
-                continue
+            chunk = pending[start : start + _BATCH_SIZE]
+            papers = self._db.get_papers_by_ids(chunk)
 
             try:
-                col_ids, tags = self._categoriser.categorise_paper(paper, self._db)
-                new_col_ids = list(set(paper.collection_ids) | set(col_ids))
-                new_tags = list(set(paper.tags) | set(tags))
-
-                if new_col_ids != paper.collection_ids or new_tags != paper.tags:
-                    paper.collection_ids = new_col_ids
-                    paper.tags = new_tags
-                    self._db.update_paper(paper)
+                results = self._categoriser.categorise_papers(papers, self._db)
+                for paper, (col_ids, tags) in zip(papers, results):
+                    new_col_ids = sorted(set(paper.collection_ids) | set(col_ids))
+                    new_tags = sorted(set(paper.tags) | set(tags))
+                    if new_col_ids != paper.collection_ids or new_tags != paper.tags:
+                        paper.collection_ids = new_col_ids
+                        paper.tags = new_tags
+                        self._db.update_paper(paper)
             except Exception as e:
-                logger.warning("Categorisation failed for paper %s: %s", paper_id, e)
+                logger.warning("Categorisation failed for a batch of %d: %s", len(chunk), e)
 
-            processed.add(paper_id)
-            done += 1
+            processed.update(chunk)
+            done += len(chunk)
             self.progress.emit(done, total)
 
-            if done % _STATE_SAVE_INTERVAL == 0:
+            if done % _STATE_SAVE_INTERVAL < _BATCH_SIZE:
                 self._save_state(processed)
                 self.log_message.emit(f"Progress: {done:,} / {total:,}")
 

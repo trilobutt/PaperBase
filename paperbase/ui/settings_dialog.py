@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -9,6 +10,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from paperbase.core.db import Database
 from paperbase.ui import theme
 from paperbase.ui.glass import CanvasBackdrop, GlassPanel
 
@@ -71,11 +73,18 @@ class Settings:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, parent: Optional[QWidget] = None) -> None:
+    # Asked for by the Library maintenance group, answered by MainWindow: the scan
+    # dialog outlives this modal one, so this dialog cannot be the thing that owns it.
+    backfill_requested = pyqtSignal()
+
+    def __init__(
+        self, settings: Settings, db: Database, parent: Optional[QWidget] = None
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(560)
         self._settings = settings
+        self._db = db
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -249,6 +258,81 @@ class SettingsDialog(QDialog):
         app_form.addRow("", motion_note)
 
         layout.addWidget(appearance_box)
+
+        # ---- Library maintenance ----
+        # Amber, the import region's hue: fingerprinting is the import pipeline's own
+        # maintenance job, and coverage short of the whole library is a caution.
+        maint_box = QGroupBox("Library maintenance")
+        maint_box.setProperty("accent", "amber")
+        maint_form = QFormLayout(maint_box)
+        maint_form.setVerticalSpacing(theme.SPACE)
+        maint_form.setHorizontalSpacing(theme.SPACE * 2)
+
+        # Read once, when the dialog is built: this states what was true on opening, and
+        # a figure that moved while the user was typing in another field would be noise.
+        hashed, total = self._db.get_hash_coverage()
+        complete = total > 0 and hashed >= total
+
+        coverage_row = QWidget()
+        coverage_col = QVBoxLayout(coverage_row)
+        coverage_col.setContentsMargins(0, 0, 0, 0)
+        coverage_col.setSpacing(theme.SPACE)
+
+        status_row = QHBoxLayout()
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(theme.SPACE * 2)
+
+        if total == 0:
+            coverage_text = "No papers in the library yet."
+        elif complete:
+            coverage_text = f"All {total:,} papers fingerprinted."
+        else:
+            coverage_text = f"{hashed:,} of {total:,} papers fingerprinted."
+        # No word wrap: all three of its strings are one short sentence, and wrapping lets
+        # the layout hand it a narrow width and break it across two lines next to a button.
+        coverage_label = QLabel(coverage_text)
+        status_row.addWidget(coverage_label)
+
+        # The remedy sits beside the state it answers, so the row reads as one sentence.
+        # The stretch goes after the button, not into the label: pushed to the far right
+        # edge of a 700px row the button reads as unrelated chrome.
+        scan_btn = QPushButton("Scan library…")
+        scan_btn.setEnabled(total > 0)
+        scan_btn.clicked.connect(self._request_backfill)
+        status_row.addWidget(scan_btn)
+        status_row.addStretch(1)
+        coverage_col.addLayout(status_row)
+
+        if total > 0 and not complete:
+            # The caution state, in the vocabulary needs-review already uses on the paper
+            # form: amber on the value itself and an amber left edge on the consequence.
+            # Never a banner across the group, which is the shape a reader skips.
+            coverage_label.setStyleSheet(f"color: {theme.ACCENT_AMBER};")
+            caution = QLabel(
+                "Papers without a fingerprint cannot be recognised as duplicates by "
+                "their contents."
+            )
+            caution.setWordWrap(True)
+            caution.setStyleSheet(
+                f"color: {theme.TEXT_PRIMARY};"
+                f"border-left: 2px solid {theme.ACCENT_AMBER};"
+                f"padding-left: {theme.SPACE}px;"
+            )
+            coverage_col.addWidget(caution)
+
+        maint_form.addRow("Fingerprints:", coverage_row)
+
+        scan_note = QLabel(
+            "Reads every PDF once and records a fingerprint, so the same file is never "
+            "imported twice. Papers imported before fingerprinting was added have none "
+            "until the scan runs. The scan can be stopped and resumed, and changes "
+            "nothing else about a paper."
+        )
+        scan_note.setObjectName("FieldNote")
+        scan_note.setWordWrap(True)
+        maint_form.addRow("", scan_note)
+
+        layout.addWidget(maint_box)
         layout.addStretch(1)
 
         # ---- Dialog buttons: a chrome strip, matching the window's command bar ----
@@ -264,6 +348,16 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         button_bar.content_layout.addWidget(buttons)
         outer.addWidget(button_bar)
+
+    def _request_backfill(self) -> None:
+        """Hand the scan to the window, saving and closing on the way out.
+
+        The scan window is non-modal and runs for as long as the library is large;
+        leaving a modal Settings dialog in front of it would hold the application shut
+        for the length of the run.
+        """
+        self.backfill_requested.emit()
+        self._accept()
 
     # ------------------------------------------------------------------
     # Category table helpers

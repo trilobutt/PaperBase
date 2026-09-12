@@ -37,6 +37,20 @@ py -3.12 -m paperbase.main
 # Smoke-test after any import or dataclass change
 py -3.12 -c "from paperbase.xxx import yyy; print('OK')"
 
+# Behavioural checks (there is no pytest suite; these are it)
+py -3.12 tools/check_hash_schema.py      # content_hash column, queries, migration
+py -3.12 tools/check_hash_indexes.py     # both late-column indexes, fresh and migrated
+py -3.12 tools/check_metadata_read.py    # read_pdf / extract_doi / extract_isbn / sha256
+py -3.12 tools/check_clients.py          # no module builds its own AsyncClient
+py -3.12 tools/check_phase5.py           # the no-await-between-claim-and-insert invariant
+py -3.12 tools/check_batch_encode.py     # one encode per batch, against a fake model
+py -3.12 tools/check_import_flush.py     # concurrent run, flush order, all three dedupe keys
+py -3.12 tools/check_backfill.py         # HashBackfillWorker over readable and missing files
+
+# Throughput, against the numbers in tasks/bench-baseline.txt
+py -3.12 tools/bench_network.py          # live Crossref; ~110ms/DOI pooled
+py -3.12 tools/bench_import.py --papers 60   # network stubbed; ~76ms/paper
+
 # Debug DB directly (replace DOI as needed)
 py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"
 ```
@@ -73,7 +87,8 @@ paperbase/
 │   ├── import_dialog.py          # Batch import: drop PDFs / paste DOIs / paste URLs
 │   ├── collection_tree.py        # Left panel: hierarchical QTreeView
 │   ├── settings_dialog.py        # Library root, folder pattern, user email
-│   └── categorisation_dialog.py  # Progress dialog for retroactive categorisation
+│   ├── categorisation_dialog.py  # Progress dialog for retroactive categorisation
+│   └── backfill_dialog.py        # Fingerprint scan progress + duplicate report
 ├── core/
 │   ├── db.py          # SQLite schema + all CRUD; no ORM
 │   ├── indexer.py     # Tantivy: build, incremental update, search
@@ -83,6 +98,7 @@ paperbase/
 │   ├── organiser.py   # File copy/move per naming pattern; compute_destination
 │   ├── importer.py    # ImportWorker(QThread): orchestrates all pipelines
 │   ├── categoriser.py # EmbeddingCategoriser + CategorizationWorker
+│   ├── backfill.py    # HashBackfillWorker: fills content_hash on pre-hash rows
 │   └── llm.py         # Dead code — thin adapter over EmbeddingCategoriser, not imported anywhere
 └── models/
     ├── paper.py
@@ -118,7 +134,8 @@ CREATE TABLE IF NOT EXISTS papers (
     needs_review    INTEGER NOT NULL DEFAULT 0,
     open_access     INTEGER NOT NULL DEFAULT 0,
     isbn            TEXT,                        -- ISBN-13 preferred; populated for books
-    document_type   TEXT NOT NULL DEFAULT 'article'
+    document_type   TEXT NOT NULL DEFAULT 'article',
+    content_hash    TEXT                         -- SHA-256 of PDF bytes; NULL pre-backfill
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -133,6 +150,14 @@ CREATE INDEX IF NOT EXISTS idx_papers_year         ON papers(year);
 CREATE INDEX IF NOT EXISTS idx_papers_title        ON papers(title);
 CREATE INDEX IF NOT EXISTS idx_papers_needs_review ON papers(needs_review);
 ```
+
+`idx_papers_content_hash` and `idx_papers_isbn` are created in `_migrate`, never in
+`SCHEMA_SQL`. `open()` runs `executescript(SCHEMA_SQL)` before `_migrate`, so against a
+database predating a column the `CREATE INDEX` aborts `open()` with `no such column` and the
+`ALTER TABLE` that would have fixed it never runs. An index on a late-added column belongs
+after its `ALTER` and outside the `try/except sqlite3.OperationalError` wrapping the `ALTER`s:
+a failed `ALTER` is the expected no-op that guard exists for, while a failed `CREATE INDEX
+IF NOT EXISTS` on a column known to exist is a real fault worth raising.
 
 `metadata_source` values: `"crossref"` | `"openlibrary"` | `"googlebooks"` | `"xmp"` | `"manual"` | `"filename"`.
 `document_type` values: `"article"` | `"book"` | `"book-chapter"` | `"proceedings"`.
@@ -165,6 +190,7 @@ class Paper:
     open_access: bool
     isbn: Optional[str] = None        # keyword default — keeps construction sites without it valid
     document_type: str = 'article'
+    content_hash: Optional[str] = None   # SHA-256 of the PDF bytes; None on pre-backfill rows
 
 @dataclass
 class SearchResult:
@@ -202,13 +228,38 @@ All text fields use the `en_stem` tokenizer, so `regex_query` matches against **
 
 ## DOI Extraction Pipeline (`core/metadata.py`)
 
-**`extract_doi_from_pdf(path)`:** Regex `r'\b(10\.\d{4,9}/[^\s"<>{|}\\^[\]`]+)'` across first 3 pages (first 100 lines), then full first-page text, then `fitz.Document.metadata` subject/keywords fields. Strips trailing `.,;)`.
+**One PDF read per file.** `read_pdf(path) -> PdfText` opens the file once and returns
+`pages: list[str]`, `xmp: dict`, `sha256: str` and `ok: bool`, with `head` (first 3 pages),
+`first_page` and `fulltext` as properties. Every extraction step takes that `PdfText`; nothing
+in the import path opens a PDF a second time. `read_pdf` never raises — an unreadable file
+comes back `ok=False` with an empty hash. It is blocking, so callers reach it through
+`asyncio.to_thread` (PyMuPDF releases the GIL, so the other in-flight items keep moving).
+`sha256_file(path)` streams the same digest in 1 MB chunks for the Settings fingerprint scan,
+so a paper's hash never depends on which entry point computed it.
 
-**`resolve_metadata(doi)`:** GET `https://api.crossref.org/works/{doi}` with polite-pool User-Agent (`mailto:` included). Crossref legitimately returns `title: []`/`author: []` for some valid DOIs — these set `needs_review=True`. Exponential retry on 429, max 3 attempts.
+**`extract_doi(pdf)`:** Regex `r'\b(10\.\d{4,9}/[^\s"<>{|}\\^[\]`]+)'` across the first 100 lines of `pdf.head`, then all of
+`pdf.first_page`, then `pdf.xmp` subject/keywords. Strips trailing `.,;)`.
+`extract_isbn(pdf)` searches `pdf.head`, ISBN-13 preferred.
 
-**`guess_metadata_from_text(path)`:** Candidate title = longest line ≥20 chars in first 20 lines. Queries Crossref bibliographic search; accepts result if `difflib.SequenceMatcher` ratio ≥0.75. Falls back to XMP metadata, then filename — both set `needs_review=True`.
+**Every network function takes the caller's `httpx.AsyncClient`** as its last argument and
+builds none of its own: `resolve_metadata(doi, user_email, rate_limiter, client)`,
+`guess_metadata(path, pdf, user_email, rate_limiter, client)`,
+`resolve_book_metadata(isbn, rate_limiter, client)` (no `user_email` — neither book source
+uses one), `_crossref_bib_search(title, user_email, rate_limiter, client)`. A fresh client per
+request pays a TLS handshake every call: 627ms per DOI measured, against 152ms reused.
 
-**Book metadata:** `journal` stores publisher name. Lookup order: Open Library → Google Books (both free, no API key). Import pipeline: DOI → ISBN → `resolve_book_metadata` → `guess_metadata_from_text`.
+**`resolve_metadata`:** GET `https://api.crossref.org/works/{doi}` with polite-pool
+User-Agent (`mailto:` included). Crossref legitimately returns `title: []`/`author: []` for
+some valid DOIs — these set `needs_review=True`. Exponential retry on 429, max 3 attempts.
+
+**`guess_metadata`:** Candidate title = longest line >=20 chars in the first 20 lines of
+`pdf.first_page`. Queries Crossref bibliographic search; accepts the result if
+`difflib.SequenceMatcher` ratio >=0.75. Falls back to XMP metadata, then filename — both set
+`needs_review=True`. `path` is still needed for `file_path` and the filename fallback.
+
+**Book metadata:** `journal` stores publisher name. Lookup order: Open Library → Google Books
+(both free, no API key). Import pipeline: DOI → ISBN → `resolve_book_metadata` →
+`guess_metadata`.
 
 ---
 
@@ -224,7 +275,7 @@ class ScrapeResult:
     source_url:     str
 ```
 
-`scrape_landing_page(url)` extracts metadata in priority order:
+`scrape_landing_page(url, client)` extracts metadata in priority order:
 
 1. **Highwire Press tags** (`citation_doi`, `citation_pdf_url`, `citation_title`, `citation_author`, `citation_journal_title`, `citation_publication_date`, `citation_volume`, `citation_issue`, `citation_firstpage`/`citation_lastpage`, `citation_abstract`, `citation_keywords`) — covers Springer, Nature, Elsevier, Wiley, OUP, CUP, PLOS, PMC, arXiv, bioRxiv, ACS, RSC, IEEE. `citation_pdf_url` presence sets `is_open_access=True`.
 2. **Dublin Core** (`DC.identifier` → doi, `DC.title`, `DC.creator`, `DC.source` → journal, `DC.date`) — institutional repos, OJS.
@@ -236,12 +287,22 @@ class ScrapeResult:
 
 **PDF URL verification (HEAD request):** confirm `Content-Type: application/pdf`. Login redirect (URL contains `login`/`sso`/`auth`/`signin`/`access`), non-PDF content type, 401/403, or network error → `pdf_url = None`.
 
-`classify_url(url)`: HEAD → `"pdf"` if `application/pdf` or URL ends `.pdf`; else `"landing_page"`. Network error → `"landing_page"`.
+`classify_url(url, client)`: HEAD → `"pdf"` if `application/pdf` or URL ends `.pdf`; else
+`"landing_page"`. Network error → `"landing_page"`.
+
+Both, plus `_verify_pdf_url(url, client)`, take the caller's client. **`max_redirects` is an
+`httpx` client-construction argument and is not accepted per request**, unlike `timeout`,
+`headers` and `follow_redirects`; passing it to `client.get` raises `TypeError`, which
+`except httpx.HTTPError` does not catch, so the call site dies rather than degrading. When
+moving a client argument onto a request, check it is in the per-request signature.
 
 ---
 
 ## Unpaywall Downloader (`core/downloader.py`)
 
+`download_via_unpaywall(doi, user_email, tmp_dir, rate_limiter, client)` and
+`download_pdf_direct(url, doi, tmp_dir, client)` take the caller's client; `user_email` stays
+because Unpaywall takes it as a query parameter rather than a User-Agent.
 GET `https://api.unpaywall.org/v2/{doi}?email={user_email}`. Uses `best_oa_location.url_for_pdf`; falls back to `best_oa_location.url`. No OA PDF → `DownloadResult(success=False, reason="no_oa_pdf")` — do NOT add to library. Saves to `{library_root}/tmp/{doi_sanitised}.pdf` (replace `/` with `_`, strip illegal chars).
 
 ---
@@ -262,21 +323,63 @@ Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land
 
 ## Batch Import (`core/importer.py` — `ImportWorker(QThread)`)
 
-**Mode 1 (drop PDFs):** Check `file_path` duplicate → extract DOI → Crossref resolve or guess metadata → copy → insert DB → index.
+**Mode 1 (drop PDFs):** `read_pdf` → hash check → extract DOI → Crossref resolve or guess
+metadata → claim → copy → insert DB → buffer for flush.
 
-**Mode 2 (paste DOIs):** Check DOI duplicate → Unpaywall download → resolve Crossref → move → insert → index.
+**Mode 2 (paste DOIs):** DOI check → Unpaywall download → `read_pdf` → hash check → resolve
+Crossref → claim → move → insert → buffer.
 
-**Mode 3 (paste URLs):** `classify_url` → if `"pdf"`: download directly, extract DOI post-download. If `"landing_page"`: scrape → check DOI duplicate → attempt `pdf_url` download → fallback Unpaywall → `ItemFailed` if nothing works.
+**Mode 3 (paste URLs):** `classify_url` → if `"pdf"`: download, then `read_pdf` and extract
+the DOI from it. If `"landing_page"`: scrape → DOI check → attempt `pdf_url` download →
+fallback Unpaywall → `ItemFailed` if nothing works.
 
-**Duplicate detection:** All modes check DOI in DB. URL mode: if DOI found in PDF body post-download and already in DB, unlink tmp and skip.
+**Four items in flight.** `_run_async` builds one `httpx.AsyncClient` for the whole run and
+`_MAX_CONCURRENT_ITEMS` (4) `_worker` coroutines pulling from an `asyncio.Queue`. Not a
+module-level client: the worker owns its event loop (`asyncio.new_event_loop()`), and a client
+bound to a dead loop is a latent failure. 8 in flight measured 35ms/DOI against 56ms but sits
+closer to Crossref's polite-pool ceiling. Identical entries in one item list are collapsed
+(`dict.fromkeys`, which keeps the user's order) before any worker sees them.
+
+**Duplicate detection has three keys: content hash, DOI, ISBN.** Not fuzzy title matching,
+which would fire on errata, corrigenda and conference-then-journal pairs. Two methods, and the
+split is load-bearing:
+
+- `_is_known(kind, value)` is a cheap early look at the database only. It claims nothing and
+  is not authoritative. Every path calls it on the content hash the moment the file exists
+  locally, which costs one indexed lookup on the common non-duplicate case.
+- `_claim_paper(paper, pdf)` is the single authority. It sets `paper.content_hash`, then checks
+  and claims hash, DOI and ISBN against both the database and `self._claimed` (the keys taken
+  by items already in flight this run, bounded by the item count and discarded with the
+  worker). **There is no `await` between `_claim_paper` and `insert_paper`, and none may ever
+  be added**: that unbroken window is what stops the event loop interleaving another item
+  between the duplicate check, the destination name and the insert. Adding one reopens both
+  the duplicate race and a duplicate-destination race. `tools/check_import_flush.py` asserts
+  it against the source text.
+
+A path whose claim fails unlinks its tmp download and counts the item as a duplicate, never as
+a failure. `paper_exists_by_path` is deliberately gone rather than repaired: it compared the
+source path against `file_path`, which `place_file(move=False)` fills with the destination, so
+it never matched anything.
 
 **Rate limiting:** Crossref min 20ms (`RateLimiter` with `asyncio.Lock`). Unpaywall min 100ms.
 
 **Counters:** the worker holds `done == imported + dupes + failed + skipped`, and `ImportDialog` labels them so they visibly sum. `needs_review` is a subset of `imported`, never a separate bucket. ETA divides by `worked` (items this run did real work for), not by `done`, or resumed items collapse the estimate.
 
-**Index commits are batched** every `INDEX_COMMIT_INTERVAL` (200) documents plus once at the end. A Tantivy commit is an fsync and a new segment; never call `commit()` per document.
+**One flush point, not per-paper work.** `_buffer(paper, fulltext)` queues a placed paper;
+`_flush_pending()` categorises the batch in one model pass, indexes it, commits Tantivy, and
+only then appends the state lines. It runs every `INDEX_COMMIT_INTERVAL` (50) papers, or when
+buffered text passes `_PENDING_TEXT_LIMIT` (8 MB), and once more in `_run_async`'s `finally`.
+50 rather than 200 because an incremental run is about 200 papers and at 200 it would flush
+once, at the very end. `_flush_pending` is synchronous and contains no `await`, so the four
+workers cannot interleave inside it and it needs no lock; the model pass does stall them for
+its duration, which is the trade. A Tantivy commit is an fsync and a new segment; never call
+`commit()` per document.
 
-**Resume state:** `{library_root}/import_state.json` is append-only, one JSON string per line, written per item (`_append_state`). A legacy `{"processed": [...]}` object is still read and collapsed once via `_rewrite_state`. Do not go back to rewriting the whole set: at 150k items that was tens of GB of bookkeeping writes. UI shows total/processed/succeeded/needs\_review/failed and running ETA. User can pause/resume at any time; app remains fully usable during import.
+State is written last, after the index commit, so an item counts as processed once its row,
+its index entry and its tags are all durable. A crash before that costs a redo of the batch.
+
+**Resume state:** `{library_root}/import_state.json` is append-only, one JSON string per line,
+written one flush at a time (`_append_state(items: list[str])`, one file open per flush). A legacy `{"processed": [...]}` object is still read and collapsed once via `_rewrite_state`. Do not go back to rewriting the whole set: at 150k items that was tens of GB of bookkeeping writes. UI shows total/processed/succeeded/needs\_review/failed and running ETA. User can pause/resume at any time; app remains fully usable during import.
 
 ---
 
@@ -284,7 +387,19 @@ Papers with `metadata_source in ("xmp", "filename")` bypass the pattern → land
 
 - `EmbeddingCategoriser`: owned by `MainWindow`, shared (with `threading.Lock`) to `ImportDialog` and `CategorizationDialog`.
 - `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and categories non-empty.
-- `categorise_paper()` returns `(collection_ids, tags)` to **merge onto** the paper, never replace. Creates missing top-level collections automatically.
+- `categorise_papers(papers, db)` returns one `(collection_ids, tags)` pair per input paper,
+  positionally, to **merge onto** that paper, never replace. It creates missing top-level
+  collections through `_resolve_collections`, one `get_collections()` per batch. Prefer it to
+  `categorise_paper`, which survives only as a single-paper wrapper: on CPU one `encode` over
+  64 texts costs little more than one over a single document, and the per-paper version also
+  read the whole collections table once per matched category. `_BATCH_SIZE` is 64.
+- The merge uses `sorted(set(...))`, not `list(set(...))`: comparing an unordered
+  `list(set(...))` against `paper.collection_ids` reports a change whenever the ordering
+  differs and writes a row that did not need writing.
+- `_load_models(name)` is a module-level factory returning `(SentenceTransformer, KeyBERT)`.
+  Neither library is a hard dependency, so tests monkeypatch that one seam rather than the
+  imports. KeyBERT's `extract_keywords` returns a flat list for a single document and a list
+  of lists for several; normalise before zipping.
 - Model: `all-MiniLM-L6-v2` (~23 MB, cached in `~/.cache/torch/sentence_transformers/`). Do NOT switch to Qwen3-Embedding-0.6B (27× slower on CPU). Quality upgrade path: `BAAI/bge-small-en-v1.5`.
 - CPU-only by design. Install `torch` from PyPI, whose default Windows wheel is the CPU
   build. A CUDA build buys nothing on a GTX 1050 Ti: PyTorch dropped Pascal (`sm_61`) from
@@ -330,6 +445,21 @@ sits in the Papers panel's header slot via `GlassPanel.add_header_widget`.
   guessing pipeline fills (title, authors, journal, year), never as a banner.
 - The results panel is a `QStackedWidget`: table, loading, empty library, no query match, no
   filter match. Every absence is a designed `EmptyState`, not a blank grid.
+- Settings carries a `Library maintenance` group whose `Fingerprints:` row states hash coverage
+  (read once at construction) and, when it is short of the whole library, goes amber with the
+  consequence spelled out beneath an amber left edge — the same vocabulary `needs_review` uses
+  on the paper form. `Scan library…` emits `backfill_requested` and closes Settings, which
+  saves; `MainWindow` opens `BackfillDialog` non-modally afterwards, because a scan over
+  130,000 files must not hold the application shut.
+- `BackfillDialog` (`ui/backfill_dialog.py`) is amber like the rest of the import family: a run
+  panel (status line, bar, capped log) over a `Duplicates` report whose three states are all
+  designed — nothing scanned, no duplicates (lime), and the groups list. Its end-state bar
+  shows actual coverage rather than 100%, or a run where every file was unreadable would read
+  as a clean finish. Nothing in it deletes, merges or edits a paper, and it says so on its
+  face: which copy to keep depends on file quality and folder placement, which no rule here
+  can judge.
+- The Import dialog shows one amber line when coverage is incomplete, and nothing at all when
+  it is complete. That gap is the one place the missing fingerprints cost the user something.
 
 ---
 
@@ -417,7 +547,11 @@ them, one accent hue per region. Tokens live as module constants in `paperbase/u
 
 **Settings field — 5 places:** `Settings.__init__` (default), `.save`, `.load`, `SettingsDialog._build_ui`, `SettingsDialog._accept`. If consumed by `ImportWorker`: also `ImportWorker.__init__` and `ImportDialog._start_import`.
 
-**`place_file` call sites:** Exactly 5 in `importer.py` (`_import_pdf`, `_import_doi`, `_import_direct_pdf_url`, two in `_import_landing_page`). Post-placement hooks and `_apply_categorisation` must be added at all 5. `_apply_categorisation` is called immediately after `paper.id = paper_id` at all 5 `insert_paper` sites.
+**`place_file` call sites:** Exactly 5 in `importer.py` (`_import_pdf`, `_import_doi`,
+`_import_direct_pdf_url`, two in `_import_landing_page`). Each is preceded by its
+`_claim_paper` guard and followed by `insert_paper` then `_buffer(paper, pdf.fulltext)`, with
+no `await` anywhere between the claim and the insert. A post-placement hook must be added at
+all 5, and `tools/check_phase5.py` counts every one of those calls.
 
 **Nothing heavy before the first paint:** `MainWindow.__init__` only builds widgets. `main.py` calls `window.show()` then `window.start_deferred_load()`, which stages the listing, the collection tree, and the categoriser preload behind `QTimer.singleShot`. `CollectionTree.__init__` deliberately does not call `refresh()`. `SearchPanel._apply_filters` returns early until `_loaded`, or the sort Qt triggers during construction runs a full-library query before the window is up.
 
@@ -425,11 +559,20 @@ them, one accent hue per region. Tokens live as module constants in `paperbase/u
 
 **Table columns must add up:** the results table's Title column is `QHeaderView.ResizeMode.Stretch` and the other four are fixed, so the five always fit the panel. Fixed widths for all five overflowed and pushed Year and Score out of sight.
 
-**Dialog cache invalidation:** `_open_settings` nulls `_import_dialog` and `_cat_dialog` — intentional. Both cache categoriser settings at construction; must be recreated after settings change. Do not add lazy-init guards that skip this reset.
+**Dialog cache invalidation:** `_open_settings` nulls `_import_dialog` and `_cat_dialog` — intentional. Both cache categoriser settings at construction; must be recreated after settings change. Do not add lazy-init guards that skip this reset. `_on_backfill_finished` nulls `_import_dialog` for the same reason: `ImportDialog` reads hash coverage once at construction, so a finished scan would otherwise not reach an already-built one.
 
 **SQLite variable limit:** Chunk `IN (?,?...)` at ≤900 items (`SQLITE_MAX_VARIABLE_NUMBER` = 999 on older builds). `get_papers_by_ids` already does this; do not add new unbounded IN clauses. `search_filter` instead loads its candidate ids into the per-connection `temp.search_ids` table (created in `open()`) and joins against it, which has no variable limit and lets SQLite do the ordering. `search_filter` takes `paper_ids=None` (no pre-filter, query all) vs `paper_ids=[]` (no results — distinct case).
 
 **Tag/collection filter:** handled inside SQLite by `EXISTS (SELECT 1 FROM json_each(p.tags) …)`, not in Python. `get_all_tags` uses `json_each` for the same reason. Do not reintroduce a per-id `get_paper` loop.
+
+**Tantivy `commit()` can fail transiently on Windows** with
+`ValueError: An IO error occurred: 'Access is denied. (os error 5)'`, reproducible at roughly
+1 run in 25 with frequent commits (segment files touched by another handle, typically a
+virus scanner). It is not caught anywhere, so it aborts an import run mid-flush, and the
+batch's papers are then in the database but absent from the index with nothing to retry them:
+the state lines were never written, and on a redo the content-hash check classes them as
+duplicates. Unfixed; a bounded retry inside `Indexer.commit` is the obvious remedy and is its
+own piece of work.
 
 **fitz context manager:** `fitz.Document` supports `with fitz.open(str(path)) as doc:` (PyMuPDF >= 1.18; project requires >= 1.24). Prefer this over manual `.close()` — bare `.close()` inside a `try` without `finally` leaks on exception.
 
@@ -468,7 +611,16 @@ dependencies = [
 dev = ["pyinstaller>=6.0", "pytest>=8.0", "pytest-qt>=4.4"]
 ```
 
-No test suite exists yet. `pytest`/`pytest-qt` are dev placeholders.
+There is no pytest suite. The `tools/check_*.py` scripts listed under Commands are the
+behavioural tests: each does its own `sys.path.insert`, runs against a throwaway
+`tempfile.mkdtemp()` fixture, prints one `OK` line and exits 0. Run all eight after touching
+the import, metadata, dedupe or categorisation paths. `pytest`/`pytest-qt` are dev
+placeholders.
+
+Every check must point `PAPERBASE_DATA_DIR` at a throwaway path, never at the real data
+directory, and must `db.close()` before its `TemporaryDirectory` exits: Windows holds the
+sqlite file open otherwise and cleanup raises `PermissionError`, masking a clean pass as a
+failure.
 
 `yake` is declared ahead of the keywording code that will use it. It pulls seven transitive
 dependencies (`click`, `colorama`, `jellyfish`, `networkx`, `segtok`, `tabulate`, `regex`),

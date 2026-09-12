@@ -31,14 +31,15 @@ async def download_via_unpaywall(
     user_email: str,
     tmp_dir: Path,
     rate_limiter: RateLimiter,
+    client: httpx.AsyncClient,
 ) -> DownloadResult:
     """Look up Unpaywall and download the best OA PDF for a DOI."""
     await rate_limiter.acquire_unpaywall()
 
     url = f"{UNPAYWALL_BASE}/{doi}"
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(url, params={"email": user_email})
+        resp = await client.get(url, params={"email": user_email}, follow_redirects=True,
+                                timeout=30.0)
     except httpx.HTTPError as e:
         logger.warning("Unpaywall request failed for %s: %s", doi, e)
         return DownloadResult(success=False, reason="http_error")
@@ -58,34 +59,37 @@ async def download_via_unpaywall(
     if not pdf_url:
         return DownloadResult(success=False, reason="no_oa_pdf")
 
-    return await _download_pdf(pdf_url, doi, tmp_dir)
+    return await _download_pdf(pdf_url, doi, tmp_dir, client)
 
 
-async def download_pdf_direct(url: str, doi: Optional[str], tmp_dir: Path) -> DownloadResult:
+async def download_pdf_direct(
+    url: str, doi: Optional[str], tmp_dir: Path, client: httpx.AsyncClient
+) -> DownloadResult:
     """Download a PDF directly from a URL."""
     label = doi or "unknown"
-    return await _download_pdf(url, label, tmp_dir)
+    return await _download_pdf(url, label, tmp_dir, client)
 
 
-async def _download_pdf(url: str, label: str, tmp_dir: Path) -> DownloadResult:
+async def _download_pdf(
+    url: str, label: str, tmp_dir: Path, client: httpx.AsyncClient
+) -> DownloadResult:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     safe_name = _sanitise_doi_for_path(label)
     tmp_path = tmp_dir / f"{safe_name}.pdf"
 
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True, timeout=60.0,
+        async with client.stream(
+            "GET", url, follow_redirects=True, timeout=60.0,
             headers={"User-Agent": _BROWSER_UA},
-        ) as client:
-            async with client.stream("GET", url) as resp:
-                if resp.status_code not in (200, 206):
-                    return DownloadResult(success=False, reason="http_error")
-                ct = resp.headers.get("content-type", "")
-                if not ct.startswith("application/pdf"):
-                    return DownloadResult(success=False, reason="not_pdf")
-                with open(tmp_path, "wb") as fh:
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
-                        fh.write(chunk)
+        ) as resp:
+            if resp.status_code not in (200, 206):
+                return DownloadResult(success=False, reason="http_error")
+            ct = resp.headers.get("content-type", "")
+            if not ct.startswith("application/pdf"):
+                return DownloadResult(success=False, reason="not_pdf")
+            with open(tmp_path, "wb") as fh:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    fh.write(chunk)
     except httpx.HTTPError as e:
         logger.warning("PDF download failed for %s: %s", label, e)
         return DownloadResult(success=False, reason="http_error")

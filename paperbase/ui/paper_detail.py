@@ -495,40 +495,46 @@ class PaperDetail(QWidget):
             self._isbn_lookup_btn.setText("Lookup")
 
     async def _do_doi_lookup(self, doi: str) -> None:
+        import httpx
+
         from paperbase.core.metadata import RateLimiter, resolve_metadata
         from paperbase.core.scraper import scrape_landing_page
         self._set_lookup_busy(True)
         try:
             rl = RateLimiter()
-            paper = await resolve_metadata(doi, self._user_email, rl)
-            if paper is None:
-                logger.warning("DOI lookup returned no result for %s", doi)
-                return
-            # Crossref often omits abstracts even when the publisher page has one.
-            # Fall back to scraping the DOI landing page for the abstract.
-            if not paper.abstract:
-                try:
-                    scrape = await scrape_landing_page(f"https://doi.org/{doi}")
-                    if scrape.metadata and scrape.metadata.abstract:
-                        paper.abstract = scrape.metadata.abstract
-                except Exception as scrape_err:
-                    logger.debug("Abstract scrape fallback failed for %s: %s", doi, scrape_err)
-            self._apply_lookup_result(paper)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                paper = await resolve_metadata(doi, self._user_email, rl, client)
+                if paper is None:
+                    logger.warning("DOI lookup returned no result for %s", doi)
+                    return
+                # Crossref often omits abstracts even when the publisher page has one.
+                # Fall back to scraping the DOI landing page for the abstract.
+                if not paper.abstract:
+                    try:
+                        scrape = await scrape_landing_page(f"https://doi.org/{doi}", client)
+                        if scrape.metadata and scrape.metadata.abstract:
+                            paper.abstract = scrape.metadata.abstract
+                    except Exception as scrape_err:
+                        logger.debug("Abstract scrape fallback failed for %s: %s", doi, scrape_err)
+                self._apply_lookup_result(paper)
         except Exception as e:
             logger.error("DOI lookup failed: %s", e)
         finally:
             self._set_lookup_busy(False)
 
     async def _do_isbn_lookup(self, isbn: str) -> None:
+        import httpx
+
         from paperbase.core.metadata import RateLimiter, resolve_book_metadata
         self._set_lookup_busy(True)
         try:
             rl = RateLimiter()
-            paper = await resolve_book_metadata(isbn, self._user_email, rl)
-            if paper is None:
-                logger.warning("ISBN lookup returned no result for %s", isbn)
-                return
-            self._apply_lookup_result(paper)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                paper = await resolve_book_metadata(isbn, rl, client)
+                if paper is None:
+                    logger.warning("ISBN lookup returned no result for %s", isbn)
+                    return
+                self._apply_lookup_result(paper)
         except Exception as e:
             logger.error("ISBN lookup failed: %s", e)
         finally:

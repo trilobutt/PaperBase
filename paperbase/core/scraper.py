@@ -58,12 +58,11 @@ class ScrapeResult:
     source_url: str
 
 
-async def classify_url(url: str) -> str:
+async def classify_url(url: str, client: httpx.AsyncClient) -> str:
     """Return "pdf" or "landing_page" by inspecting Content-Type via HEAD."""
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0,
-                                     headers={"User-Agent": _BROWSER_UA}) as client:
-            resp = await client.head(url)
+        resp = await client.head(url, follow_redirects=True, timeout=10.0,
+                                 headers={"User-Agent": _BROWSER_UA})
         ct = resp.headers.get("content-type", "")
         if ct.startswith("application/pdf"):
             return "pdf"
@@ -75,18 +74,19 @@ async def classify_url(url: str) -> str:
     return "landing_page"
 
 
-async def scrape_landing_page(url: str) -> ScrapeResult:
+async def scrape_landing_page(url: str, client: httpx.AsyncClient) -> ScrapeResult:
     """Scrape academic landing page for DOI, PDF URL, and metadata."""
     result = ScrapeResult(doi=None, pdf_url=None, is_open_access=False,
                           metadata=_blank_paper(), source_url=url)
 
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True, timeout=15.0,
+        # max_redirects is a client-construction argument in httpx and is not accepted
+        # per request, so the caller's client owns the cap; the chain is still bounded and
+        # still surfaces as an httpx.HTTPError when it runs away.
+        resp = await client.get(
+            url, follow_redirects=True, timeout=15.0,
             headers={"User-Agent": _BROWSER_UA},
-            max_redirects=5,
-        ) as client:
-            resp = await client.get(url)
+        )
     except httpx.HTTPError as e:
         logger.warning("Failed to fetch %s: %s", url, e)
         return result
@@ -270,7 +270,7 @@ async def scrape_landing_page(url: str) -> ScrapeResult:
 
     # ---- PDF URL verification ----
     if result.pdf_url:
-        result.pdf_url = await _verify_pdf_url(result.pdf_url)
+        result.pdf_url = await _verify_pdf_url(result.pdf_url, client)
         if result.pdf_url is None:
             result.is_open_access = False
 
@@ -280,14 +280,13 @@ async def scrape_landing_page(url: str) -> ScrapeResult:
     return result
 
 
-async def _verify_pdf_url(url: str) -> Optional[str]:
+async def _verify_pdf_url(url: str, client: httpx.AsyncClient) -> Optional[str]:
     """HEAD-check a candidate PDF URL; return it if confirmed, None otherwise."""
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=False, timeout=10.0,
-            headers={"User-Agent": _BROWSER_UA}
-        ) as client:
-            resp = await client.head(url)
+        resp = await client.head(
+            url, follow_redirects=False, timeout=10.0,
+            headers={"User-Agent": _BROWSER_UA},
+        )
 
         # Redirect to login/SSO
         if resp.status_code in (301, 302):

@@ -13,6 +13,7 @@ from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
 from paperbase.models.paper import Paper
 from paperbase.ui import theme
+from paperbase.ui.backfill_dialog import BackfillDialog
 from paperbase.ui.categorisation_dialog import CategorizationDialog
 from paperbase.ui.collection_tree import CollectionTree
 from paperbase.ui.glass import CanvasBackdrop, GlassPanel
@@ -38,6 +39,7 @@ class MainWindow(QMainWindow):
         self._settings_path = settings_path
         self._import_dialog: Optional[ImportDialog] = None
         self._cat_dialog: Optional[CategorizationDialog] = None
+        self._backfill_dialog: Optional[BackfillDialog] = None
 
         self._categoriser = EmbeddingCategoriser()
         self._categoriser.update_settings(
@@ -255,7 +257,16 @@ class MainWindow(QMainWindow):
         self._cat_dialog.raise_()
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self._settings, self)
+        backfill_requested = False
+
+        def _record_backfill() -> None:
+            # The scan cannot open over a modal dialog that is still up, so the request
+            # is only recorded here and acted on once Settings has closed and saved.
+            nonlocal backfill_requested
+            backfill_requested = True
+
+        dlg = SettingsDialog(self._settings, self._db, self)
+        dlg.backfill_requested.connect(_record_backfill)
         if dlg.exec():
             self._settings.save(self._settings_path)
             self._detail_panel.set_user_email(self._settings.user_email)
@@ -270,6 +281,27 @@ class MainWindow(QMainWindow):
             self._import_dialog = None
             self._cat_dialog = None
             self._refresh_status()
+
+        if backfill_requested:
+            self._open_backfill()
+
+    def _open_backfill(self) -> None:
+        """The fingerprint scan, non-modal exactly as categorisation is.
+
+        A pass over 130,000 files runs for as long as it runs, and holding the window
+        shut for it would make the library unusable for the duration.
+        """
+        if self._backfill_dialog is None:
+            self._backfill_dialog = BackfillDialog(db=self._db, parent=self)
+            self._backfill_dialog.finished.connect(self._on_backfill_finished)
+        self._backfill_dialog.show()
+        self._backfill_dialog.raise_()
+
+    def _on_backfill_finished(self) -> None:
+        # ImportDialog reads hash coverage once at construction; invalidate it so a scan's
+        # new coverage is reflected the next time it opens, same as the settings-change reset.
+        self._import_dialog = None
+        self.refresh_all()
 
     def _refresh_status(self) -> None:
         total = self._db.get_paper_count()

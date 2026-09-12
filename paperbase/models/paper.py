@@ -25,3 +25,4 @@ class Paper:
     open_access: bool
     isbn: Optional[str] = None          # ISBN-13 preferred; populated for books
     document_type: str = 'article'      # "article" | "book" | "book-chapter" | "proceedings"
+    content_hash: Optional[str] = None  # SHA-256 of the PDF bytes; None on pre-hash rows

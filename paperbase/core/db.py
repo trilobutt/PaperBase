@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS papers (
     needs_review    INTEGER NOT NULL DEFAULT 0,
     open_access     INTEGER NOT NULL DEFAULT 0,
     isbn            TEXT,
-    document_type   TEXT NOT NULL DEFAULT 'article'
+    document_type   TEXT NOT NULL DEFAULT 'article',
+    content_hash    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -60,7 +61,7 @@ def _now_iso() -> str:
 _SLIM_COLS = (
     "id, doi, title, authors, journal, year, volume, issue, pages, "
     "tags, collection_ids, file_path, date_added, date_modified, "
-    "metadata_source, needs_review, open_access, isbn, document_type"
+    "metadata_source, needs_review, open_access, isbn, document_type, content_hash"
 )
 
 
@@ -88,6 +89,7 @@ def _paper_from_row(row: sqlite3.Row) -> Paper:
         open_access=bool(row["open_access"]),
         isbn=row["isbn"] if "isbn" in keys else None,
         document_type=row["document_type"] if "document_type" in keys else "article",
+        content_hash=row["content_hash"] if "content_hash" in keys else None,
     )
 
 
@@ -115,6 +117,7 @@ def _paper_slim_from_row(row: sqlite3.Row) -> Paper:
         open_access=bool(row["open_access"]),
         isbn=row["isbn"] if "isbn" in keys else None,
         document_type=row["document_type"] if "document_type" in keys else "article",
+        content_hash=row["content_hash"] if "content_hash" in keys else None,
     )
 
 
@@ -148,11 +151,20 @@ class Database:
         for stmt in (
             "ALTER TABLE papers ADD COLUMN isbn TEXT",
             "ALTER TABLE papers ADD COLUMN document_type TEXT NOT NULL DEFAULT 'article'",
+            "ALTER TABLE papers ADD COLUMN content_hash TEXT",
         ):
             try:
                 self._conn.execute(stmt)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Indexes on late-added columns cannot live in SCHEMA_SQL: open() runs that script
+        # through executescript before this method, so on a database predating the column the
+        # CREATE INDEX would abort open() with "no such column". Here the ALTER above has
+        # already run, and IF NOT EXISTS makes the repeat harmless on every later open.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_papers_content_hash ON papers(content_hash)"
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_papers_isbn ON papers(isbn)")
 
     def close(self) -> None:
         if self._conn:
@@ -176,8 +188,8 @@ class Database:
                 (doi, title, authors, journal, year, volume, issue, pages,
                  abstract, keywords, tags, collection_ids, file_path,
                  date_added, date_modified, metadata_source, needs_review, open_access,
-                 isbn, document_type)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 isbn, document_type, content_hash)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 paper.doi,
@@ -200,6 +212,7 @@ class Database:
                 int(paper.open_access),
                 paper.isbn,
                 paper.document_type,
+                paper.content_hash,
             ),
         )
         conn.commit()
@@ -213,7 +226,8 @@ class Database:
                 doi=?, title=?, authors=?, journal=?, year=?, volume=?, issue=?,
                 pages=?, abstract=?, keywords=?, tags=?, collection_ids=?,
                 file_path=?, date_modified=?, metadata_source=?,
-                needs_review=?, open_access=?, isbn=?, document_type=?
+                needs_review=?, open_access=?, isbn=?, document_type=?,
+                content_hash=?
             WHERE id=?
             """,
             (
@@ -236,6 +250,7 @@ class Database:
                 int(paper.open_access),
                 paper.isbn,
                 paper.document_type,
+                paper.content_hash,
                 paper.id,
             ),
         )
@@ -247,7 +262,7 @@ class Database:
             "doi", "title", "authors", "journal", "year", "volume", "issue",
             "pages", "abstract", "keywords", "tags", "collection_ids",
             "file_path", "metadata_source", "needs_review", "open_access",
-            "isbn", "document_type",
+            "isbn", "document_type", "content_hash",
         }
         if field not in allowed:
             raise ValueError(f"Unknown field: {field}")
@@ -296,6 +311,59 @@ class Database:
             by_id.update({r["id"]: _paper_slim_from_row(r) for r in rows})
         return [by_id[i] for i in ids if i in by_id]
 
+    def paper_exists_by_hash(self, content_hash: str) -> bool:
+        conn = self._conn_required()
+        row = conn.execute(
+            "SELECT 1 FROM papers WHERE content_hash=?", (content_hash,)
+        ).fetchone()
+        return row is not None
+
+    def paper_exists_by_isbn(self, isbn: str) -> bool:
+        conn = self._conn_required()
+        row = conn.execute("SELECT 1 FROM papers WHERE isbn=?", (isbn,)).fetchone()
+        return row is not None
+
+    def get_papers_missing_hash(self) -> list[tuple[int, str]]:
+        """(id, file_path) for every row with no content hash yet.
+
+        The backfill tool is resumable purely by re-running this: a row leaves the result set
+        as soon as its hash is written.
+        """
+        conn = self._conn_required()
+        rows = conn.execute(
+            "SELECT id, file_path FROM papers "
+            "WHERE content_hash IS NULL OR content_hash = '' ORDER BY id"
+        ).fetchall()
+        return [(r["id"], r["file_path"]) for r in rows]
+
+    def get_hash_coverage(self) -> tuple[int, int]:
+        """(rows carrying a content hash, rows in total).
+
+        One pass over an indexed column, so the Settings dialog can state plainly how much of
+        the library is protected from content duplicates every time it opens.
+        """
+        conn = self._conn_required()
+        row = conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "COUNT(CASE WHEN content_hash IS NOT NULL AND content_hash != '' "
+            "           THEN 1 END) AS hashed "
+            "FROM papers"
+        ).fetchone()
+        return row["hashed"], row["total"]
+
+    def get_duplicate_hash_groups(self) -> list[tuple[str, list[int]]]:
+        """Every content hash held by more than one row, with those rows' ids.
+
+        Reporting only. Nothing in the application deletes on the strength of this.
+        """
+        conn = self._conn_required()
+        rows = conn.execute(
+            "SELECT content_hash, GROUP_CONCAT(id) AS ids FROM papers "
+            "WHERE content_hash IS NOT NULL AND content_hash != '' "
+            "GROUP BY content_hash HAVING COUNT(*) > 1 ORDER BY content_hash"
+        ).fetchall()
+        return [(r["content_hash"], [int(i) for i in r["ids"].split(",")]) for r in rows]
+
     def delete_paper(self, paper_id: int) -> None:
         conn = self._conn_required()
         conn.execute("DELETE FROM papers WHERE id=?", (paper_id,))
@@ -304,11 +372,6 @@ class Database:
     def paper_exists_by_doi(self, doi: str) -> bool:
         conn = self._conn_required()
         row = conn.execute("SELECT 1 FROM papers WHERE doi=?", (doi,)).fetchone()
-        return row is not None
-
-    def paper_exists_by_path(self, file_path: str) -> bool:
-        conn = self._conn_required()
-        row = conn.execute("SELECT 1 FROM papers WHERE file_path=?", (file_path,)).fetchone()
         return row is not None
 
     def get_paper_count(self) -> int:

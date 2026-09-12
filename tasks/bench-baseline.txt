@@ -1,0 +1,4 @@
+network dois=24 mode=current per_doi=1151.6ms total=27.64s
+import papers=60 pages=12 latency=0.05 elapsed=8.47s per_paper=141.2ms
+after: network dois=24 mode=pooled concurrency=4 per_doi=112.1ms total=2.69s
+after: import papers=60 pages=12 latency=0.05 elapsed=4.54s per_paper=75.7ms

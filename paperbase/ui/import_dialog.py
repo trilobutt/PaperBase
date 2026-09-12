@@ -117,6 +117,23 @@ class ImportDialog(QDialog):
         self._tabs.addTab(url_tab, "Paste URLs")
 
         source_panel.set_content(self._tabs)
+
+        # One amber line, and only while it is true. Without a fingerprint, a file the
+        # library already holds under a different name imports a second time and nobody
+        # is told; this is the one place that gap costs the user anything, so it is the
+        # one place it is said. Read once here, and it gates nothing.
+        hashed, total = self._db.get_hash_coverage()
+        missing = total - hashed
+        if missing > 0:
+            subject = "paper has" if missing == 1 else "papers have"
+            gap_note = QLabel(
+                f"{missing:,} {subject} no fingerprint yet, so identical files may "
+                "import twice. Settings → Scan library."
+            )
+            gap_note.setWordWrap(True)
+            gap_note.setStyleSheet(f"color: {theme.ACCENT_AMBER};")
+            source_panel.content_layout.addWidget(gap_note)
+
         layout.addWidget(source_panel, 1)
 
         # ---- Progress: the amber region's live surface ----

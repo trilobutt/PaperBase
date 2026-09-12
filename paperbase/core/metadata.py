@@ -1,8 +1,10 @@
 import asyncio
 import difflib
+import hashlib
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -48,47 +50,99 @@ def _validate_doi(doi: str) -> bool:
     return bool(re.match(r"^10\.\d{4,9}/", doi))
 
 
-def extract_doi_from_pdf(path: Path) -> Optional[str]:
-    """Extract first DOI from PDF text and XMP metadata."""
+@dataclass
+class PdfText:
+    """Everything one read of a PDF yields.
+
+    Built once per imported file and passed to every extraction step, so a PDF is opened and
+    parsed once instead of four times. Plain strings only, so it can be handed across the
+    thread boundary the import worker reads it on.
+    """
+    pages: list[str]
+    xmp: dict[str, str]
+    sha256: str
+    ok: bool
+
+    @property
+    def head(self) -> str:
+        """First three pages, which is where identifiers live."""
+        return "\n".join(self.pages[:3])
+
+    @property
+    def first_page(self) -> str:
+        return self.pages[0] if self.pages else ""
+
+    @property
+    def fulltext(self) -> str:
+        """Every page, for the Tantivy `fulltext` field."""
+        return "\n".join(self.pages)
+
+
+def sha256_file(path: Path) -> str:
+    """SHA-256 of a file's bytes, streamed in 1 MB chunks. "" if it cannot be read.
+
+    The import path and the Settings fingerprint scan both go through this, so a paper's hash
+    cannot depend on which one computed it. Streamed rather than read whole: a scanned book
+    can run to hundreds of megabytes and four items are in flight at once.
+    """
+    digest = hashlib.sha256()
     try:
-        doc = fitz.open(str(path))
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as e:
+        logger.warning("Cannot hash %s: %s", path, e)
+        return ""
+    return digest.hexdigest()
+
+
+def read_pdf(path: Path) -> PdfText:
+    """Read a PDF's bytes, text and XMP metadata.
+
+    Blocking and I/O-bound; the import worker calls it through `asyncio.to_thread` so the
+    other in-flight items keep going. Never raises: a file that cannot be opened comes back
+    `ok=False` with an empty hash.
+
+    The file is read twice, once to hash and once by `fitz`. The second read comes from the
+    OS page cache, and SHA-256 runs at 2.3 GB/s here, so this costs far less than holding the
+    whole document in memory to serve both.
+    """
+    sha = sha256_file(path)
+    try:
+        with fitz.open(str(path)) as doc:
+            pages = [page.get_text() for page in doc]
+            xmp = dict(doc.metadata or {})
     except Exception as e:
-        logger.warning("Cannot open PDF %s: %s", path, e)
-        return None
+        logger.warning("Cannot read PDF %s: %s", path, e)
+        return PdfText(pages=[], xmp={}, sha256=sha, ok=False)
+    return PdfText(pages=pages, xmp=xmp, sha256=sha, ok=True)
 
-    with doc:
-        # Check first 3 pages
-        text_parts: list[str] = []
-        for page_num in range(min(3, len(doc))):
-            text_parts.append(doc[page_num].get_text())
-        full_text = "\n".join(text_parts)
 
-        # Search first 100 lines
-        lines = full_text.splitlines()
-        for line in lines[:100]:
-            m = DOI_RE.search(line)
-            if m:
-                doi = _strip_trailing_punct(m.group(1))
-                if _validate_doi(doi):
-                    return doi
+def extract_doi(pdf: "PdfText") -> Optional[str]:
+    """Extract first DOI from an already-read PDF's text and XMP metadata."""
+    # Search first 100 lines of the first 3 pages
+    for line in pdf.head.splitlines()[:100]:
+        m = DOI_RE.search(line)
+        if m:
+            doi = _strip_trailing_punct(m.group(1))
+            if _validate_doi(doi):
+                return doi
 
-        # Try entire first-page text
-        if text_parts:
-            m = DOI_RE.search(text_parts[0])
-            if m:
-                doi = _strip_trailing_punct(m.group(1))
-                if _validate_doi(doi):
-                    return doi
+    # Try entire first-page text
+    m = DOI_RE.search(pdf.first_page)
+    if m:
+        doi = _strip_trailing_punct(m.group(1))
+        if _validate_doi(doi):
+            return doi
 
-        # Check XMP metadata fields
-        meta = doc.metadata
-        for key in ("subject", "keywords"):
-            val = meta.get(key, "") or ""
-            m = DOI_RE.search(val)
-            if m:
-                doi = _strip_trailing_punct(m.group(1))
-                if _validate_doi(doi):
-                    return doi
+    # Check XMP metadata fields
+    for key in ("subject", "keywords"):
+        val = pdf.xmp.get(key, "") or ""
+        m = DOI_RE.search(val)
+        if m:
+            doi = _strip_trailing_punct(m.group(1))
+            if _validate_doi(doi):
+                return doi
 
     return None
 
@@ -98,34 +152,26 @@ def _normalise_isbn(raw: str) -> str:
     return re.sub(r"[- ]", "", raw).upper()
 
 
-def extract_isbn_from_pdf(path: Path) -> Optional[str]:
-    """Extract first ISBN from PDF text, preferring ISBN-13. Returns normalised digit string."""
-    try:
-        doc = fitz.open(str(path))
-    except Exception as e:
-        logger.warning("Cannot open PDF %s: %s", path, e)
-        return None
+def extract_isbn(pdf: "PdfText") -> Optional[str]:
+    """Extract first ISBN from an already-read PDF, preferring ISBN-13. Normalised digits."""
+    full_text = pdf.head
 
-    with doc:
-        text_parts: list[str] = []
-        for page_num in range(min(3, len(doc))):
-            text_parts.append(doc[page_num].get_text())
-        full_text = "\n".join(text_parts)
+    # Prefixed ISBN (most reliable)
+    m = ISBN_RE.search(full_text)
+    if m:
+        return _normalise_isbn(m.group(1))
 
-        # Prefixed ISBN (most reliable)
-        m = ISBN_RE.search(full_text)
-        if m:
-            return _normalise_isbn(m.group(1))
-
-        # Bare ISBN-13 (common on copyright pages)
-        m2 = ISBN13_BARE_RE.search(full_text)
-        if m2:
-            return _normalise_isbn(m2.group(1))
+    # Bare ISBN-13 (common on copyright pages)
+    m2 = ISBN13_BARE_RE.search(full_text)
+    if m2:
+        return _normalise_isbn(m2.group(1))
 
     return None
 
 
-async def resolve_metadata(doi: str, user_email: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+async def resolve_metadata(
+    doi: str, user_email: str, rate_limiter: "RateLimiter", client: httpx.AsyncClient
+) -> Optional[Paper]:
     """Query Crossref for full metadata for a DOI."""
     url = f"{CROSSREF_BASE}/{doi}"
     headers = {"User-Agent": f"PaperBase/1.0 (mailto:{user_email})"}
@@ -133,8 +179,7 @@ async def resolve_metadata(doi: str, user_email: str, rate_limiter: "RateLimiter
     for attempt in range(3):
         await rate_limiter.acquire_crossref()
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-                resp = await client.get(url, headers=headers)
+            resp = await client.get(url, headers=headers)
         except httpx.HTTPError as e:
             logger.warning("Crossref request failed for %s: %s", doi, e)
             return None
@@ -248,8 +293,18 @@ def _parse_crossref_response(data: dict, doi: str) -> Paper:
     )
 
 
-async def guess_metadata_from_text(path: Path, user_email: str, rate_limiter: "RateLimiter") -> Paper:
-    """Best-effort metadata extraction when no DOI is found."""
+async def guess_metadata(
+    path: Path,
+    pdf: "PdfText",
+    user_email: str,
+    rate_limiter: "RateLimiter",
+    client: httpx.AsyncClient,
+) -> Paper:
+    """Best-effort metadata extraction when no DOI is found.
+
+    `path` is still needed for `file_path` and the filename fallback; every byte of text
+    comes from `pdf`.
+    """
     now = _now_iso()
     base_paper = Paper(
         id=None, doi=None, title="", authors=[], journal="", year=None,
@@ -259,14 +314,12 @@ async def guess_metadata_from_text(path: Path, user_email: str, rate_limiter: "R
         isbn=None, document_type="article",
     )
 
-    # Extract first-page text
-    try:
-        with fitz.open(str(path)) as doc:
-            first_page_text = doc[0].get_text() if len(doc) > 0 else ""
-            xmp_meta = doc.metadata
-    except Exception:
+    if not pdf.ok:
         base_paper.title = path.name
         return base_paper
+
+    first_page_text = pdf.first_page
+    xmp_meta = pdf.xmp
 
     # Candidate title: longest line in first 20 lines, >= 20 chars, has space
     lines = [l.strip() for l in first_page_text.splitlines() if l.strip()]
@@ -277,7 +330,7 @@ async def guess_metadata_from_text(path: Path, user_email: str, rate_limiter: "R
 
     if candidate_title:
         # Try Crossref bibliographic search
-        found = await _crossref_bib_search(candidate_title, user_email, rate_limiter)
+        found = await _crossref_bib_search(candidate_title, user_email, rate_limiter, client)
         if found:
             found.file_path = str(path)
             return found
@@ -299,7 +352,7 @@ async def guess_metadata_from_text(path: Path, user_email: str, rate_limiter: "R
 
 
 async def _crossref_bib_search(
-    title: str, user_email: str, rate_limiter: "RateLimiter"
+    title: str, user_email: str, rate_limiter: "RateLimiter", client: httpx.AsyncClient
 ) -> Optional[Paper]:
     params = {
         "query.bibliographic": title,
@@ -309,8 +362,7 @@ async def _crossref_bib_search(
     headers = {"User-Agent": f"PaperBase/1.0 (mailto:{user_email})"}
     await rate_limiter.acquire_crossref()
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(CROSSREF_BASE, params=params, headers=headers)
+        resp = await client.get(CROSSREF_BASE, params=params, headers=headers)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -331,24 +383,27 @@ async def _crossref_bib_search(
     return None
 
 
-async def resolve_book_metadata(isbn: str, user_email: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+async def resolve_book_metadata(
+    isbn: str, rate_limiter: "RateLimiter", client: httpx.AsyncClient
+) -> Optional[Paper]:
     """
     Resolve book metadata by ISBN.
     Tries Open Library first; falls back to Google Books.
     Returns None if neither source yields a result.
     """
-    paper = await _openlibrary_lookup(isbn, rate_limiter)
+    paper = await _openlibrary_lookup(isbn, rate_limiter, client)
     if paper:
         return paper
-    return await _googlebooks_lookup(isbn, rate_limiter)
+    return await _googlebooks_lookup(isbn, rate_limiter, client)
 
 
-async def _openlibrary_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+async def _openlibrary_lookup(
+    isbn: str, rate_limiter: "RateLimiter", client: httpx.AsyncClient
+) -> Optional[Paper]:
     params = {"bibkeys": f"ISBN:{isbn}", "format": "json", "jscmd": "data"}
     await rate_limiter.acquire_crossref()  # reuse the crossref slot for general rate limiting
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(OPENLIBRARY_BASE, params=params)
+        resp = await client.get(OPENLIBRARY_BASE, params=params)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -418,12 +473,13 @@ async def _openlibrary_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optiona
     )
 
 
-async def _googlebooks_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optional[Paper]:
+async def _googlebooks_lookup(
+    isbn: str, rate_limiter: "RateLimiter", client: httpx.AsyncClient
+) -> Optional[Paper]:
     params = {"q": f"isbn:{isbn}"}
     await rate_limiter.acquire_crossref()
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(GOOGLEBOOKS_BASE, params=params)
+        resp = await client.get(GOOGLEBOOKS_BASE, params=params)
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -482,17 +538,6 @@ async def _googlebooks_lookup(isbn: str, rate_limiter: "RateLimiter") -> Optiona
         isbn=isbn,
         document_type="book",
     )
-
-
-def extract_fulltext(path: Path) -> str:
-    """Extract full text from a PDF for Tantivy indexing."""
-    try:
-        with fitz.open(str(path)) as doc:
-            parts = [page.get_text() for page in doc]
-        return "\n".join(parts)
-    except Exception as e:
-        logger.warning("Full-text extraction failed for %s: %s", path, e)
-        return ""
 
 
 class RateLimiter:
