@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from paperbase.core.db import Database
+from paperbase.core.taxonomy import TaxonomyError, load_taxonomy
 from paperbase.ui import theme
 from paperbase.ui.glass import CanvasBackdrop, GlassPanel
 
@@ -29,11 +30,21 @@ class Settings:
         self.auto_categorise: bool = True       # run categoriser on each new import
         self.category_threshold: float = 0.35  # min cosine similarity to assign a category
         self.tag_count: int = 5                # keywords to extract per paper
+        self.taxonomy_path: str = ""           # blank means {library_root}/taxonomy.txt
+        self.taxonomy_top_k: int = 4           # max taxonomy labels assigned per paper
         # Appearance
         self.reduce_motion: bool = False       # collapse every animation to an instant swap
 
     def is_configured(self) -> bool:
         return bool(self.library_root and self.user_email)
+
+    def taxonomy_file(self) -> Optional[Path]:
+        """Resolved taxonomy file, or None when there is nowhere to put one yet."""
+        if self.taxonomy_path:
+            return Path(self.taxonomy_path)
+        if self.library_root:
+            return Path(self.library_root) / "taxonomy.txt"
+        return None
 
     def save(self, path: Path) -> None:
         data = {
@@ -47,6 +58,8 @@ class Settings:
             "auto_categorise": self.auto_categorise,
             "category_threshold": self.category_threshold,
             "tag_count": self.tag_count,
+            "taxonomy_path": self.taxonomy_path,
+            "taxonomy_top_k": self.taxonomy_top_k,
             "reduce_motion": self.reduce_motion,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -66,6 +79,8 @@ class Settings:
                 s.auto_categorise = data.get("auto_categorise", True)
                 s.category_threshold = float(data.get("category_threshold", 0.35))
                 s.tag_count = int(data.get("tag_count", 5))
+                s.taxonomy_path = data.get("taxonomy_path", "")
+                s.taxonomy_top_k = int(data.get("taxonomy_top_k", 4))
                 s.reduce_motion = bool(data.get("reduce_motion", False))
             except Exception:
                 pass
@@ -197,16 +212,113 @@ class SettingsDialog(QDialog):
         self._tag_count_spin.setValue(self._settings.tag_count)
         cat_form.addRow("Keywords per paper:", self._tag_count_spin)
 
+        # The group now configures two mechanisms, a fixed taxonomy and free-text
+        # categories, and the three rows above serve both. Each mechanism gets a bold
+        # heading three units clear of what precedes it, the section rhythm the paper
+        # form uses, so the seam reads without splitting the group into two panels. The
+        # taxonomy rows stay in this form so they share its label rail.
+        taxonomy_heading = QLabel("Taxonomy")
+        taxonomy_heading.setObjectName("FieldGroupLabel")
+        # The form spaces its rows one unit apart; the margin supplies the other two.
+        taxonomy_heading.setContentsMargins(0, theme.SPACE * 2, 0, 0)
+        cat_form.addRow(taxonomy_heading)
+
+        # The field and its note share one column, one unit apart, as the Fingerprints
+        # row does: given a form row of its own, the wrapped note was handed a height
+        # for a narrower width than it got and sat centred in the surplus, 40px clear
+        # of the field it describes.
+        taxonomy_row = QWidget()
+        taxonomy_col = QVBoxLayout(taxonomy_row)
+        taxonomy_col.setContentsMargins(0, 0, 0, 0)
+        taxonomy_col.setSpacing(theme.SPACE)
+        taxonomy_hl = QHBoxLayout()
+        taxonomy_hl.setContentsMargins(0, 0, 0, 0)
+        self._taxonomy_edit = QLineEdit(self._settings.taxonomy_path)
+        self._taxonomy_edit.setPlaceholderText("Blank uses taxonomy.txt in the library root")
+        taxonomy_browse_btn = QPushButton("Browse…")
+        taxonomy_browse_btn.clicked.connect(self._browse_taxonomy)
+        taxonomy_hl.addWidget(self._taxonomy_edit)
+        taxonomy_hl.addWidget(taxonomy_browse_btn)
+        taxonomy_col.addLayout(taxonomy_hl)
+
+        # Read once on opening, like the fingerprint coverage further down: the note
+        # describes the saved file, never a path half-typed into the field above it.
+        # load_taxonomy answers [] for a missing file, which would print as "0 labels",
+        # so absence is tested first and said in words. The state leads, since it is the
+        # part that changes; the format and the seeding tool follow it.
+        taxonomy_file = self._settings.taxonomy_file()
+        # A no-break space keeps the format example whole; wrapped after the colon it
+        # reads as two separate words.
+        file_format = "One label per line, as Name or Name:\u00a0description."
+        seed_hint = "tools/seed_taxonomy.py drafts a fresh one from your tags and keywords."
+        unreadable = False
+        if taxonomy_file is None or not taxonomy_file.exists():
+            # Every fresh install lands here. It is the ordinary starting state, so the
+            # note says what to do next in the note's own colour, with no alarm.
+            note_text = (
+                "No taxonomy file yet. tools/seed_taxonomy.py drafts one from your tags "
+                f"and keywords for you to edit. {file_format}"
+            )
+        else:
+            where = (
+                taxonomy_file.name if self._settings.taxonomy_path
+                else "taxonomy.txt in the library root"
+            )
+            try:
+                label_count = len(load_taxonomy(taxonomy_file))
+            except TaxonomyError as exc:
+                unreadable = True
+                note_text = f"{where} {exc.reason}, so no labels are assigned from it."
+            else:
+                held = (
+                    "no labels yet" if label_count == 0
+                    else "1 label" if label_count == 1
+                    else f"{label_count:,} labels"
+                )
+                note_text = f"{where} holds {held}. {file_format} {seed_hint}"
+        taxonomy_note = QLabel(note_text)
+        taxonomy_note.setWordWrap(True)
+        if unreadable:
+            # A hand-edited file that silently contributes nothing is worth the eye: the
+            # caution vocabulary the Fingerprints row and needs-review already use.
+            taxonomy_note.setStyleSheet(
+                f"color: {theme.TEXT_PRIMARY};"
+                f"border-left: 2px solid {theme.ACCENT_AMBER};"
+                f"padding-left: {theme.SPACE}px;"
+            )
+        else:
+            taxonomy_note.setObjectName("FieldNote")
+        taxonomy_col.addWidget(taxonomy_note)
+        cat_form.addRow("Taxonomy file:", taxonomy_row)
+
+        self._top_k_spin = QSpinBox()
+        self._top_k_spin.setRange(1, 10)
+        self._top_k_spin.setValue(self._settings.taxonomy_top_k)
+        self._top_k_spin.setToolTip(
+            "The most taxonomy labels a single paper can be assigned.\n"
+            "A paper gets fewer when fewer labels clear the assignment threshold."
+        )
+        cat_form.addRow("Labels per paper:", self._top_k_spin)
+
         cat_layout.addLayout(cat_form)
 
-        # Category table
+        # Category table, under the second heading. The group's two-unit spacing plus a
+        # one-unit margin matches the three-unit gap above "Taxonomy", and heading and
+        # note sit one unit apart as the taxonomy heading and its first row do.
+        categories_head = QVBoxLayout()
+        categories_head.setSpacing(theme.SPACE)
+        categories_heading = QLabel("Categories")
+        categories_heading.setObjectName("FieldGroupLabel")
+        categories_heading.setContentsMargins(0, theme.SPACE, 0, 0)
+        categories_head.addWidget(categories_heading)
         cat_label = QLabel(
-            "Categories — each becomes a top-level collection. The description is used "
-            "to calibrate the embedding; richer descriptions improve accuracy."
+            "Each becomes a top-level collection. The description is used to calibrate "
+            "the embedding; richer descriptions improve accuracy."
         )
         cat_label.setWordWrap(True)
         cat_label.setObjectName("FieldNote")
-        cat_layout.addWidget(cat_label)
+        categories_head.addWidget(cat_label)
+        cat_layout.addLayout(categories_head)
 
         self._cat_table = QTableWidget(0, 2)
         self._cat_table.setHorizontalHeaderLabels(["Name", "Description (optional)"])
@@ -399,6 +511,15 @@ class SettingsDialog(QDialog):
         if path:
             self._secondary_dest_edit.setText(path)
 
+    def _browse_taxonomy(self) -> None:
+        # The library root is where a blank setting puts the file, so start there.
+        start = self._taxonomy_edit.text() or self._root_edit.text() or str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Taxonomy File", start, "Text files (*.txt)"
+        )
+        if path:
+            self._taxonomy_edit.setText(path)
+
     # ------------------------------------------------------------------
 
     def _accept(self) -> None:
@@ -409,6 +530,8 @@ class SettingsDialog(QDialog):
         self._settings.auto_categorise = self._auto_cat_check.isChecked()
         self._settings.category_threshold = self._threshold_spin.value()
         self._settings.tag_count = self._tag_count_spin.value()
+        self._settings.taxonomy_path = self._taxonomy_edit.text().strip()
+        self._settings.taxonomy_top_k = self._top_k_spin.value()
         self._settings.reduce_motion = self._reduce_motion_check.isChecked()
         # Applied here rather than by the caller: every animation in the application asks
         # theme at the moment it would start, so the box takes effect on OK without a

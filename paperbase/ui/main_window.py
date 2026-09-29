@@ -1,3 +1,4 @@
+import logging
 import threading
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,8 @@ from PyQt6.QtWidgets import (
 from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
+from paperbase.core.taxonomy import TaxonomyError, load_taxonomy
+from paperbase.core.vectors import VectorStore
 from paperbase.models.paper import Paper
 from paperbase.ui import theme
 from paperbase.ui.backfill_dialog import BackfillDialog
@@ -22,6 +25,8 @@ from paperbase.ui.paper_detail import PaperDetail
 from paperbase.ui.search_panel import SearchPanel
 from paperbase.ui.settings_dialog import Settings, SettingsDialog
 
+logger = logging.getLogger(__name__)
+
 
 class MainWindow(QMainWindow):
     def __init__(
@@ -30,6 +35,7 @@ class MainWindow(QMainWindow):
         indexer: Indexer,
         settings: Settings,
         settings_path: Path,
+        vector_store: VectorStore,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -37,16 +43,13 @@ class MainWindow(QMainWindow):
         self._indexer = indexer
         self._settings = settings
         self._settings_path = settings_path
+        self._vector_store = vector_store
         self._import_dialog: Optional[ImportDialog] = None
         self._cat_dialog: Optional[CategorizationDialog] = None
         self._backfill_dialog: Optional[BackfillDialog] = None
 
         self._categoriser = EmbeddingCategoriser()
-        self._categoriser.update_settings(
-            categories=settings.categories,
-            threshold=settings.category_threshold,
-            tag_count=settings.tag_count,
-        )
+        self._apply_categoriser_settings()
         self.setWindowTitle("PaperBase")
         self.setMinimumSize(1100, 680)
         self._build_ui()
@@ -68,8 +71,23 @@ class MainWindow(QMainWindow):
         self._refresh_status()
 
     def _preload_categoriser(self) -> None:
-        if self._settings.auto_categorise and self._settings.categories:
+        if self._settings.auto_categorise and self._categoriser.has_categories:
             threading.Thread(target=self._categoriser.load_model, daemon=True).start()
+
+    def _apply_categoriser_settings(self) -> None:
+        """Push settings plus the taxonomy file onto the categoriser. One place, two callers."""
+        try:
+            labels = load_taxonomy(self._settings.taxonomy_file())
+        except TaxonomyError as e:
+            logger.warning("Taxonomy could not be read: %s", e)
+            labels = []
+        self._categoriser.update_settings(
+            categories=self._settings.categories,
+            threshold=self._settings.category_threshold,
+            tag_count=self._settings.tag_count,
+            labels=labels,
+            top_k=self._settings.taxonomy_top_k,
+        )
 
     def _build_ui(self) -> None:
         """Three rows of floating glass on a painted canvas: commands, work, status.
@@ -229,6 +247,7 @@ class MainWindow(QMainWindow):
                 settings=self._settings,
                 state_file=state_file,
                 categoriser=self._categoriser,
+                vector_store=self._vector_store,
                 parent=self,
             )
             self._import_dialog.import_finished.connect(self.refresh_all)
@@ -245,11 +264,10 @@ class MainWindow(QMainWindow):
                 return
 
         if self._cat_dialog is None:
-            state_file = Path(self._settings.library_root) / "categorisation_state.json"
             self._cat_dialog = CategorizationDialog(
                 db=self._db,
                 categoriser=self._categoriser,
-                state_file=state_file,
+                store=self._vector_store,
                 parent=self,
             )
             self._cat_dialog.finished.connect(self.refresh_all)
@@ -270,11 +288,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._settings.save(self._settings_path)
             self._detail_panel.set_user_email(self._settings.user_email)
-            self._categoriser.update_settings(
-                categories=self._settings.categories,
-                threshold=self._settings.category_threshold,
-                tag_count=self._settings.tag_count,
-            )
+            self._apply_categoriser_settings()
             # If categories were just configured for the first time, preload the model.
             self._preload_categoriser()
             # ImportDialog is cached; invalidate it so it picks up the new categoriser state.

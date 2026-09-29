@@ -16,13 +16,18 @@ dependencies = [
     "platformdirs>=4.2",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
+    "numpy>=1.26",
     "sentence-transformers>=3.0",
-    "keybert>=0.8",
     "yake>=0.7",
 ]
 
 [project.optional-dependencies]
 dev = ["pyinstaller>=6.0", "pytest>=8.0", "pytest-qt>=4.4"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
 
 [project.scripts]
 paperbase = "paperbase.main:main"

@@ -12,6 +12,7 @@ from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.importer import ImportWorker
 from paperbase.core.indexer import Indexer
+from paperbase.core.vectors import VectorStore
 from paperbase.ui import theme
 from paperbase.ui.glass import CanvasBackdrop, GlassPanel, accent_glow
 from paperbase.ui.settings_dialog import Settings
@@ -32,6 +33,7 @@ class ImportDialog(QDialog):
         settings: Optional[Settings] = None,
         state_file: Optional[Path] = None,
         categoriser: Optional[EmbeddingCategoriser] = None,
+        vector_store: Optional[VectorStore] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -46,6 +48,7 @@ class ImportDialog(QDialog):
         self._settings = settings
         self._state_file = state_file
         self._categoriser = categoriser
+        self._vector_store = vector_store
         self._worker: Optional[ImportWorker] = None
         self._build_ui()
 
@@ -251,6 +254,7 @@ class ImportDialog(QDialog):
             folder_pattern=self._settings.folder_pattern,
             secondary_dest=secondary_dest,
             categoriser=self._categoriser if self._settings and self._settings.auto_categorise else None,
+            vector_store=self._vector_store,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(self._on_log)

@@ -17,8 +17,10 @@ from PyQt6.QtWidgets import (
 )
 from platformdirs import user_data_dir
 
+from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
+from paperbase.core.vectors import VectorStore
 from paperbase.ui import theme
 from paperbase.ui.glass import CanvasBackdrop, GlassPanel, display_font
 from paperbase.ui.main_window import MainWindow
@@ -183,7 +185,12 @@ def main() -> None:
     indexer = Indexer(index_dir)
     indexer.open()
 
-    window = MainWindow(db, indexer, settings, settings_path)
+    vector_store = VectorStore(
+        data / "paper_vectors.f32", model_name=EmbeddingCategoriser.MODEL_NAME
+    )
+    vector_store.open()
+
+    window = MainWindow(db, indexer, settings, settings_path, vector_store)
     window.show()
     window.start_deferred_load()
 
@@ -195,6 +202,7 @@ def main() -> None:
     with loop:
         loop.run_forever()
 
+    vector_store.close()
     indexer.close()
     db.close()
 

@@ -37,7 +37,10 @@ py -3.12 -m paperbase.main
 # Smoke-test after any import or dataclass change
 py -3.12 -c "from paperbase.xxx import yyy; print('OK')"
 
-# Behavioural checks (there is no pytest suite; these are it)
+# Tests: needs neither sentence-transformers nor a display (see Dependencies)
+py -3.12 -m pytest tests
+
+# Behavioural checks for the import path
 py -3.12 tools/check_hash_schema.py      # content_hash column, queries, migration
 py -3.12 tools/check_hash_indexes.py     # both late-column indexes, fresh and migrated
 py -3.12 tools/check_metadata_read.py    # read_pdf / extract_doi / extract_isbn / sha256
@@ -51,13 +54,17 @@ py -3.12 tools/check_backfill.py         # HashBackfillWorker over readable and 
 py -3.12 tools/bench_network.py          # live Crossref; ~110ms/DOI pooled
 py -3.12 tools/bench_import.py --papers 60   # network stubbed; ~76ms/paper
 
+# Draft a taxonomy from the library's tags and keywords (read-only; refuses to overwrite)
+py -3.12 tools/seed_taxonomy.py --db <paperbase.db> --out <library_root>/taxonomy.txt
+
 # Debug DB directly (replace DOI as needed)
 py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"
 ```
 
-**Runtime data dir:** `%LOCALAPPDATA%\PaperBase\PaperBase\` — `paperbase.db`, `index/`, `settings.json`.
+**Runtime data dir:** `%LOCALAPPDATA%\PaperBase\PaperBase\` — `paperbase.db`, `index/`, `settings.json`,
+`paper_vectors.f32` + `paper_vectors.json` (the vector store; see Auto-Categorisation).
 `PAPERBASE_DATA_DIR` overrides it (must be an absolute path, else `SystemExit`); `tools/make_fixture.py` builds a throwaway one to test against.
-`import_state.json` and `categorisation_state.json` live at `{library_root}/` (alongside PDFs, not in app data dir).
+`import_state.json` and the default `taxonomy.txt` live at `{library_root}/` (alongside PDFs, not in app data dir).
 
 ---
 
@@ -71,7 +78,8 @@ py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import 
 | Database | SQLite (`sqlite3` / `aiosqlite`) | Flat schema, no ORM |
 | HTTP client | `httpx` (async) | Crossref, Unpaywall, scraping |
 | Qt/asyncio bridge | `qasync` | Main-thread asyncio loop |
-| Embedding / tagging | `sentence-transformers` `all-MiniLM-L6-v2` + `keybert` | CPU-only, ~23 MB |
+| Embedding | `sentence-transformers` `all-MiniLM-L6-v2` + `numpy` | CPU-only, ~23 MB |
+| Keywords | `yake` | Statistical, no model |
 
 ---
 
@@ -98,6 +106,10 @@ paperbase/
 │   ├── organiser.py   # File copy/move per naming pattern; compute_destination
 │   ├── importer.py    # ImportWorker(QThread): orchestrates all pipelines
 │   ├── categoriser.py # EmbeddingCategoriser + CategorizationWorker
+│   ├── vectors.py     # VectorStore: persistent paper embeddings
+│   ├── taxonomy.py    # Label; parse/load/save the hand-edited taxonomy file
+│   ├── assign.py      # top_labels: chunked cosine assignment, pure numpy
+│   ├── keywords.py    # extract_keywords: YAKE plus stop-token and overlap filters
 │   ├── backfill.py    # HashBackfillWorker: fills content_hash on pre-hash rows
 │   └── llm.py         # Dead code — thin adapter over EmbeddingCategoriser, not imported anywhere
 └── models/
@@ -375,8 +387,9 @@ workers cannot interleave inside it and it needs no lock; the model pass does st
 its duration, which is the trade. A Tantivy commit is an fsync and a new segment; never call
 `commit()` per document.
 
-State is written last, after the index commit, so an item counts as processed once its row,
-its index entry and its tags are all durable. A crash before that costs a redo of the batch.
+State is written last, after the index commit and the vector-store flush, so an item counts as
+processed once its row, its index entry, its tags and its vector are all durable. A crash
+before that costs a redo of the batch.
 
 **Resume state:** `{library_root}/import_state.json` is append-only, one JSON string per line,
 written one flush at a time (`_append_state(items: list[str])`, one file open per flush). A legacy `{"processed": [...]}` object is still read and collapsed once via `_rewrite_state`. Do not go back to rewriting the whole set: at 150k items that was tens of GB of bookkeeping writes. UI shows total/processed/succeeded/needs\_review/failed and running ETA. User can pause/resume at any time; app remains fully usable during import.
@@ -386,20 +399,36 @@ written one flush at a time (`_append_state(items: list[str])`, one file open pe
 ## Auto-Categorisation (`core/categoriser.py`)
 
 - `EmbeddingCategoriser`: owned by `MainWindow`, shared (with `threading.Lock`) to `ImportDialog` and `CategorizationDialog`.
-- `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and categories non-empty.
-- `categorise_papers(papers, db)` returns one `(collection_ids, tags)` pair per input paper,
-  positionally, to **merge onto** that paper, never replace. It creates missing top-level
+- `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and `has_categories` (free-text categories or taxonomy labels).
+- `categorise_papers(papers, db, vector_store=None)` returns one `(collection_ids, tags)` pair
+  per input paper, positionally, to **merge onto** that paper, never replace. Collections are
+  the union of free-text category matches and at most `top_k` taxonomy labels, both against
+  the one threshold; tags are YAKE (`core/keywords.py`) and need no model. Given a
+  `vector_store`, it persists each paper's embedding from the same batched encode, which is how
+  the importer stores vectors without a second model call. It creates missing top-level
   collections through `_resolve_collections`, one `get_collections()` per batch. Prefer it to
   `categorise_paper`, which survives only as a single-paper wrapper: on CPU one `encode` over
-  64 texts costs little more than one over a single document, and the per-paper version also
-  read the whole collections table once per matched category. `_BATCH_SIZE` is 64.
+  64 texts costs little more than one over a single document. `_BATCH_SIZE` is 64.
 - The merge uses `sorted(set(...))`, not `list(set(...))`: comparing an unordered
   `list(set(...))` against `paper.collection_ids` reports a change whenever the ordering
   differs and writes a row that did not need writing.
-- `_load_models(name)` is a module-level factory returning `(SentenceTransformer, KeyBERT)`.
-  Neither library is a hard dependency, so tests monkeypatch that one seam rather than the
-  imports. KeyBERT's `extract_keywords` returns a flat list for a single document and a list
-  of lists for several; normalise before zipping.
+- `_load_sentence_transformer(name)` is a module-level factory. sentence-transformers is not a
+  hard dependency, so tests monkeypatch that one seam rather than the import.
+- **Vector store** (`core/vectors.py`): one `VectorStore` owned by `main()` beside the DB and
+  index, injected down to both workers. `paper_vectors.f32` is headerless little-endian
+  float32 rows (a `.npy` header carries the shape, so every append would rewrite it) and
+  `paper_vectors.json` holds `dim`, `model` and the row-ordered paper ids. Derived data:
+  `open()` truncates a half-written pair back into step, and resets rather than raising on an
+  unreadable sidecar or a `dim`/`model` mismatch (bge-small is also 384-dim, so the model name
+  is what catches a model switch). A paper whose title or abstract is edited keeps its old
+  vector until `Rebuild vectors`. Windows refuses to delete the blob while a `matrix()` memmap
+  is alive, so `clear()` runs only with no worker holding one; the button is disabled during
+  a run.
+- **Taxonomy** (`core/taxonomy.py`): a plain text file, `Name` or `Name: description` per
+  line, `{library_root}/taxonomy.txt` unless `taxonomy_path` is set; `Settings.taxonomy_file()`
+  is the one resolution rule. Bad lines are skipped with a warning; an unreadable file raises
+  `TaxonomyError`, which every caller catches, since `MainWindow` loads it during construction.
+  No starter taxonomy ships; `tools/seed_taxonomy.py` drafts one on the target machine.
 - Model: `all-MiniLM-L6-v2` (~23 MB, cached in `~/.cache/torch/sentence_transformers/`). Do NOT switch to Qwen3-Embedding-0.6B (27× slower on CPU). Quality upgrade path: `BAAI/bge-small-en-v1.5`.
 - CPU-only by design. Install `torch` from PyPI, whose default Windows wheel is the CPU
   build. A CUDA build buys nothing on a GTX 1050 Ti: PyTorch dropped Pascal (`sm_61`) from
@@ -407,7 +436,12 @@ written one flush at a time (`_append_state(items: list[str])`, one file open pe
   with `no kernel image is available for execution on the device`. Embedding a
   150,000-paper library (title plus abstract, one vector each) is roughly an hour on 4 to 6
   cores, so the CPU build is sufficient for everything here.
-- Retroactive batch: `CategorizationWorker(QThread)`, state in `{library_root}/categorisation_state.json`.
+- Retroactive batch: `CategorizationWorker(QThread)` runs two stages. `embedding` encodes the
+  papers the vector store lacks (the store's id map is the resume record; there is no separate
+  state file), and `assigning` runs `assign.top_labels` over `store.matrix()` in one pass plus
+  YAKE per paper, re-run in full every time because it is idempotent and takes minutes. With
+  no model it skips `embedding` and still tags. `ImportWorker` categorises only when the model
+  is loaded, so papers imported without one wait for this run.
 - `core/llm.py` is dead code — do not import it.
 
 ---
@@ -602,26 +636,36 @@ dependencies = [
     "platformdirs>=4.2",
     "beautifulsoup4>=4.12",
     "lxml>=5.0",
+    "numpy>=1.26",
     "sentence-transformers>=3.0",
-    "keybert>=0.8",
     "yake>=0.7",
 ]
 
 [project.optional-dependencies]
 dev = ["pyinstaller>=6.0", "pytest>=8.0", "pytest-qt>=4.4"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
 ```
 
-There is no pytest suite. The `tools/check_*.py` scripts listed under Commands are the
-behavioural tests: each does its own `sys.path.insert`, runs against a throwaway
-`tempfile.mkdtemp()` fixture, prints one `OK` line and exits 0. Run all eight after touching
-the import, metadata, dedupe or categorisation paths. `pytest`/`pytest-qt` are dev
-placeholders.
+`tests/` is the pytest suite. `paperbase` is not pip-installed on the development machine, and
+`pythonpath = ["."]` is what lets pytest import it. The suite needs neither
+sentence-transformers nor a display: every categoriser test installs `FakeModel`
+(`tests/test_categoriser.py`, deterministic unit vectors from a hash of the text) through the
+`_load_sentence_transformer` seam, and worker tests call `QThread.run()` directly, which works
+with no `QApplication` and no event loop. `pytest-qt` is a dev placeholder.
+
+The `tools/check_*.py` scripts listed under Commands are the behavioural checks for the import
+path: each does its own `sys.path.insert`, runs against a throwaway `tempfile.mkdtemp()`
+fixture, prints one `OK` line and exits 0. Run all eight, and the pytest suite, after touching
+the import, metadata, dedupe or categorisation paths.
 
 Every check must point `PAPERBASE_DATA_DIR` at a throwaway path, never at the real data
 directory, and must `db.close()` before its `TemporaryDirectory` exits: Windows holds the
 sqlite file open otherwise and cleanup raises `PermissionError`, masking a clean pass as a
 failure.
 
-`yake` is declared ahead of the keywording code that will use it. It pulls seven transitive
-dependencies (`click`, `colorama`, `jellyfish`, `networkx`, `segtok`, `tabulate`, `regex`),
+`yake` pulls seven transitive dependencies (`click`, `colorama`, `jellyfish`, `networkx`, `segtok`, `tabulate`, `regex`),
 all with prebuilt cp312 Windows wheels.

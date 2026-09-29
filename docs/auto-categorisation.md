@@ -1,7 +1,8 @@
 # PaperBase: auto-categorisation and keywording
 
-Exploration document. Nothing here is built yet. This replaces the earlier RAG and cloud
-documents, both dropped.
+The vector store, taxonomy assignment and YAKE keywording described below are implemented.
+What remains is the first backfill run on the target machine and writing the taxonomy
+itself. This replaces the earlier RAG and cloud documents, both dropped.
 
 ## Scope
 
@@ -42,13 +43,13 @@ vector each. That runs on the CPU in about an hour. So:
 
 ## 2. The design
 
-The current `EmbeddingCategoriser` already does the hard part: it embeds a paper, takes a
-cosine against category descriptions, and extracts keywords with KeyBERT. Three things are
-wrong with it at 150,000 papers, and all three have the same root cause.
+The `EmbeddingCategoriser` this design started from already did the hard part: it embedded a
+paper, took a cosine against category descriptions, and extracted keywords with KeyBERT. At
+150,000 papers one flaw made it painful.
 
-**It never stores the vector it computed.** Every retroactive run re-embeds the entire
-library from scratch, which means changing one category description costs another full pass.
-That is what makes the feature painful today, and it is the only structural change needed.
+**It never stored the vector it computed.** Every retroactive run re-embedded the entire
+library from scratch, so changing one category description cost another full pass. Persisting
+the vectors is the only structural change the design needs.
 
 ### Persist the paper vectors
 
@@ -164,36 +165,49 @@ the abstract is the part written to answer it.
 
 ## 4. What changes in the code
 
-- `core/categoriser.py`: load and memory-map `paper_vectors.npy`; `categorise_paper` takes a
-  stored vector when one exists rather than embedding again; the taxonomy replaces the
-  free-text category list.
-- `core/db.py`: nothing. The vectors live in a file, and category assignments continue to go
-  into the existing `collection_ids` and `tags` JSON arrays, so the flat-schema rule is
-  untouched.
-- `core/importer.py`: after `_apply_categorisation`, append the new paper's vector. This is
-  the same five call sites the `place_file` gotcha in `CLAUDE.md` already warns about.
-- `ui/categorisation_dialog.py`: the retroactive run becomes fast enough that its progress
-  dialog is mostly redundant, though the first backfill still needs it.
-- `ui/settings_dialog.py`: point at a taxonomy file instead of editing categories in a table.
-
-| Piece | Estimate |
-|---|---|
-| Paper vector store, backfill job (resumable) | 2 days |
-| Taxonomy file, label embedding, assignment pass | 1 to 2 days |
-| YAKE keywording plus the overlap filter and stop-list | 1 day |
-| Settings and dialog changes | 1 day |
+- `core/vectors.py`: `VectorStore`, a persistent id-keyed cache of paper embeddings, backed
+  by `paper_vectors.f32` (a headerless little-endian float32 blob) plus a JSON sidecar
+  holding `dim`, `model` and the row-ordered paper ids. Not `paper_vectors.npy` as first
+  proposed above: a `.npy` header carries the array's shape, so every append would rewrite
+  the whole header; a headerless blob appends with a plain write and reads back with one
+  `np.memmap`, keeping the shape in the sidecar's id list instead.
+- `core/taxonomy.py`: `Label` and `parse_taxonomy`/`load_taxonomy`/`save_taxonomy` for the
+  taxonomy file, one label per line as `Name` or `Name: description`.
+- `core/assign.py`: `top_labels`, the chunked cosine-similarity matmul that turns a document
+  matrix and a label matrix into per-paper label assignments without holding the full
+  150,000 × labels score matrix in memory at once.
+- `core/keywords.py`: `extract_keywords`, YAKE plus the token-overlap filter from section 2.
+  `keybert` is removed from the dependency list entirely.
+- `core/categoriser.py`: `EmbeddingCategoriser.categorise_papers` persists every paper's
+  vector into a `VectorStore` as part of the same batched encode it already does, so a
+  caller never has to encode a second time to store what this method already computed.
+  `CategorizationWorker` runs two stages: `embedding` (encode whatever the vector store is
+  missing) and `assigning` (derive collections and tags from the stored vectors, with no
+  re-embedding). The vector store's id map is the resume record for the expensive stage, so
+  the JSON progress file this document originally proposed does not exist.
+- `core/importer.py`: `ImportWorker` passes its `VectorStore` into `categorise_papers`, so
+  every imported paper's vector is stored the moment it is computed, and flushes the store
+  alongside the Tantivy index commit.
+- `ui/categorisation_dialog.py`: a two-stage progress dialog. An hour-long embedding stage
+  carries the ETA; the seconds-long assigning stage that follows does not read as a stall,
+  because the status line names which stage is running rather than showing one bar for both.
+- `ui/settings_dialog.py`: a taxonomy file path and a labels-per-paper setting, alongside the
+  free-text categories table, which stays.
 
 ---
 
 ## 5. Order
 
-1. **First: `tasks/todo.md`.** Import counting, startup performance, redesign. The startup
-   work matters more on the target machine than it would here: loading 150,000 `Paper`
-   objects before the window is usable is a slow launch on 64 GB and NVMe, and swapping on
-   8 GB and a platter.
-2. Paper vector store and backfill.
-3. Taxonomy and assignment.
-4. Keywording.
+What's left, now that the vector store, taxonomy assignment and keywording are built:
+
+1. **Run the backfill** on the target machine, once `sentence-transformers` is installed and
+   the library is in place. This is real-machine work the development machine that built the
+   rest of this cannot do.
+2. **Seed and edit the taxonomy.** `tools/seed_taxonomy.py` drafts 150 to 300 labels from the
+   library's existing tags and keywords; a person edits the draft into shape from there.
+3. **Extract title and abstract where missing**, the first row of section 3's cost table.
+   Unbuilt: it has to survive real publisher PDFs, and only the target machine has them.
+   Until it lands, a paper with neither title nor abstract gets no vector and no labels.
 
 ---
 

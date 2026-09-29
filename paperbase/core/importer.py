@@ -36,6 +36,7 @@ from paperbase.core.metadata import (
 )
 from paperbase.core.organiser import DEFAULT_PATTERN, copy_to_secondary, place_file
 from paperbase.core.scraper import ScrapeResult, classify_url, scrape_landing_page
+from paperbase.core.vectors import VectorStore
 from paperbase.models.paper import Paper
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class ImportWorker(QThread):
         folder_pattern: str = DEFAULT_PATTERN,
         secondary_dest: Optional[Path] = None,
         categoriser: Optional[EmbeddingCategoriser] = None,
+        vector_store: Optional[VectorStore] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -84,6 +86,7 @@ class ImportWorker(QThread):
         self._folder_pattern = folder_pattern
         self._secondary_dest = secondary_dest
         self._categoriser = categoriser
+        self._vector_store = vector_store
         self._pause_requested = False
         self._stop_requested = False
         self._tmp_dir = library_root / "tmp"
@@ -164,6 +167,8 @@ class ImportWorker(QThread):
             for paper, fulltext in batch:
                 self._indexer.add_document(paper, fulltext)
             self._indexer.commit()
+            if self._vector_store is not None:
+                self._vector_store.flush()
 
         # State is written last, after the index commit: an item counts as processed once its
         # row, its index entry and its tags are all durable. A crash before this costs a redo
@@ -173,12 +178,19 @@ class ImportWorker(QThread):
         self._append_state(state)
 
     def _apply_categorisation_batch(self, papers: list[Paper]) -> None:
-        """Merge auto-categorisation onto a batch. No-op if no categoriser is configured or
-        its model never loaded."""
+        """Merge auto-categorisation onto a batch, and store each paper's vector. No-op if no
+        categoriser is configured or its model never loaded.
+
+        categorise_papers does the encoding (it already batches it) and, given vector_store,
+        persists each vector in the same pass, so re-running categorisation over the library
+        never re-embeds.
+        """
         if self._categoriser is None or not self._categoriser.is_loaded:
             return
         try:
-            results = self._categoriser.categorise_papers(papers, self._db)
+            results = self._categoriser.categorise_papers(
+                papers, self._db, vector_store=self._vector_store
+            )
         except Exception as e:
             logger.warning("Auto-categorisation failed for a batch of %d: %s", len(papers), e)
             return

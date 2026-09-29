@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
+from paperbase.core.taxonomy import Label, save_taxonomy
 from paperbase.models.collection import Collection
 from paperbase.models.paper import Paper
 
@@ -31,11 +32,49 @@ WORDS = [
     "symbiosis", "trilobite", "stratigraphy", "genome", "morphology", "biogeography",
     "taphonomy", "speciation", "extinction", "pollination", "carbonate", "clade",
 ]
+ORGANISMS = [
+    "trilobites", "brachiopods", "ammonites", "early tetrapods", "foraminifera",
+    "gastropods", "conodonts", "mycorrhizal fungi", "coral reefs", "graptolites",
+]
+PLACES = [
+    "the Burgess Shale", "the Chengjiang biota", "the Welsh Borderlands",
+    "coastal Madagascar", "the Ediacaran outcrops of Namibia", "the Baltic basin",
+    "the Atacama Desert", "the Yangtze Platform",
+]
+TECHNIQUES = [
+    "stable isotope analysis", "phylogenetic reconstruction",
+    "computed tomography scanning", "geochemical proxy analysis",
+    "morphometric analysis", "molecular clock dating",
+]
 TAGS = ["palaeo", "ecology", "genomics", "methods", "review", "fieldwork", "taxonomy"]
 
 
 def _title(rng: random.Random) -> str:
     return " ".join(rng.sample(WORDS, 6)).capitalize()
+
+
+def _abstract(rng: random.Random) -> str:
+    """Build a three or four sentence abstract from templates with real phrase structure.
+
+    A word bag produces meaningless YAKE keywords; these sentences give it position and
+    co-occurrence to score against, the same as a real abstract would.
+    """
+    organism = rng.choice(ORGANISMS)
+    place = rng.choice(PLACES)
+    technique = rng.choice(TECHNIQUES)
+    sentences = [
+        f"We examined {organism} from {place} to investigate patterns of {rng.choice(WORDS)}.",
+        f"Using {technique}, we reconstructed the timing of these changes across "
+        f"multiple {rng.choice(WORDS)} horizons.",
+        f"{organism.capitalize()} assemblages show clear evidence of "
+        f"{rng.choice(WORDS)} linked to shifts in local {rng.choice(WORDS)}.",
+    ]
+    if rng.random() < 0.5:
+        sentences.append(
+            f"These findings, supported by {rng.choice(TECHNIQUES)}, suggest that "
+            f"{rng.choice(WORDS)} played a larger role than previously recognised."
+        )
+    return " ".join(sentences)
 
 
 def main() -> int:
@@ -75,7 +114,7 @@ def main() -> int:
             volume=str(rng.randint(1, 300)),
             issue=str(rng.randint(1, 12)),
             pages=f"{rng.randint(1, 900)}-{rng.randint(901, 1200)}",
-            abstract=" ".join(rng.choices(WORDS, k=60)),
+            abstract=_abstract(rng),
             keywords=rng.sample(WORDS, 3),
             tags=rng.sample(TAGS, rng.randint(0, 3)),
             collection_ids=rng.sample(collections, rng.randint(0, 2)),
@@ -108,9 +147,30 @@ def main() -> int:
         "auto_categorise": False,
         "category_threshold": 0.35,
         "tag_count": 5,
+        "taxonomy_path": "",
+        "taxonomy_top_k": 4,
+        "reduce_motion": False,
     }
     (out / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
     (out / "library").mkdir(exist_ok=True)
+    taxonomy_labels = [
+        Label(name=name, description=description)
+        for name, description in (
+            ("Palaeoecology", "Interactions between fossil organisms and ancient environments"),
+            ("Phylogenetics", ""),
+            ("Sedimentology", "Formation and structure of sedimentary rock layers"),
+            ("Mycorrhizal symbiosis", ""),
+            ("Isotope geochemistry", "Stable and radiogenic isotopes as environmental tracers"),
+            ("Cambrian biota", ""),
+            ("Predator-prey dynamics", "Trophic interactions in fossil and modern communities"),
+            ("Genome evolution", ""),
+            ("Biogeography", "Spatial distribution of species and populations"),
+            ("Taphonomy", ""),
+            ("Speciation", "Processes by which new species arise"),
+            ("Pollination ecology", ""),
+        )
+    ]
+    save_taxonomy(out / "library" / "taxonomy.txt", taxonomy_labels)
     db.close()
     print(f"fixture ready: {out} ({args.papers} papers)")
     return 0

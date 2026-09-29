@@ -3,8 +3,8 @@
     py -3.12 tools/check_batch_encode.py
 
 Prints "batch encode OK" and exits 0 on success; raises AssertionError on the first
-failing check otherwise. Uses fake model/KeyBERT stand-ins via _load_models so it needs
-neither sentence-transformers nor keybert installed.
+failing check otherwise. Uses a fake model stand-in via _load_sentence_transformer so it
+needs no sentence-transformers install.
 """
 import sys
 import tempfile
@@ -32,11 +32,6 @@ class FakeModel:
         return np.ones((len(texts), 4)) / 2.0
 
 
-class FakeKeyBERT:
-    def extract_keywords(self, docs, **kwargs):
-        return [[("alpha", 0.9), ("beta", 0.8)] for _ in docs]
-
-
 def _make_paper(i: int) -> Paper:
     return Paper(
         id=None,
@@ -48,7 +43,10 @@ def _make_paper(i: int) -> Paper:
         volume="1",
         issue="1",
         pages="1-10",
-        abstract=f"Abstract text for paper {i}.",
+        abstract=(
+            f"This study examines particle interactions and cellular biology processes "
+            f"in sample {i} under controlled laboratory conditions."
+        ),
         keywords=[],
         tags=[],
         collection_ids=[],
@@ -63,8 +61,7 @@ def _make_paper(i: int) -> Paper:
 
 def main() -> None:
     fake_model = FakeModel()
-    fake_kw = FakeKeyBERT()
-    categoriser._load_models = lambda name: (fake_model, fake_kw)
+    categoriser._load_sentence_transformer = lambda name: fake_model
 
     db_path = Path(tempfile.mkdtemp()) / "paperbase.db"
     db = Database(db_path)
