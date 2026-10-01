@@ -40,7 +40,7 @@ py -3.12 -c "from paperbase.xxx import yyy; print('OK')"
 # Tests: needs neither sentence-transformers nor a display (see Dependencies)
 py -3.12 -m pytest tests
 
-# Behavioural checks for the import path
+# Behavioural checks: the import path, then the two taxa surfaces
 py -3.12 tools/check_hash_schema.py      # content_hash column, queries, migration
 py -3.12 tools/check_hash_indexes.py     # both late-column indexes, fresh and migrated
 py -3.12 tools/check_metadata_read.py    # read_pdf / extract_doi / extract_isbn / sha256
@@ -49,6 +49,8 @@ py -3.12 tools/check_phase5.py           # the no-await-between-claim-and-insert
 py -3.12 tools/check_batch_encode.py     # one encode per batch, against a fake model
 py -3.12 tools/check_import_flush.py     # concurrent run, flush order, all three dedupe keys
 py -3.12 tools/check_backfill.py         # HashBackfillWorker over readable and missing files
+py -3.12 tools/check_taxa_sidebar.py     # Taxa branch: populated, folded, kept open; filter
+py -3.12 tools/check_taxa_chips.py       # paper-panel taxon chips: validated add, lock, unlock
 
 # Throughput, against the numbers in tasks/bench-baseline.txt
 py -3.12 tools/bench_network.py          # live Crossref; ~110ms/DOI pooled
@@ -57,6 +59,9 @@ py -3.12 tools/bench_import.py --papers 60   # network stubbed; ~76ms/paper
 # Draft a taxonomy from the library's tags and keywords (read-only; refuses to overwrite)
 py -3.12 tools/seed_taxonomy.py --db <paperbase.db> --out <library_root>/taxonomy.txt
 
+# Calibrate the topic threshold and audit taxon aliases (run with PaperBase closed)
+py -3.12 tools/label_stats.py --thresholds 0.3 0.35 0.4 0.45 0.5 --sample 5000
+
 # Debug DB directly (replace DOI as needed)
 py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import user_data_dir; conn = sqlite3.connect(str(Path(user_data_dir('PaperBase','PaperBase'))/'paperbase.db')); conn.row_factory = sqlite3.Row; print(dict(conn.execute('SELECT id,title,needs_review,file_path FROM papers WHERE doi=?',('10.xxxx/yyy',)).fetchone()))"
 ```
@@ -64,7 +69,7 @@ py -3.12 -c "import sqlite3; from pathlib import Path; from platformdirs import 
 **Runtime data dir:** `%LOCALAPPDATA%\PaperBase\PaperBase\` — `paperbase.db`, `index/`, `settings.json`,
 `paper_vectors.f32` + `paper_vectors.json` (the vector store; see Auto-Categorisation).
 `PAPERBASE_DATA_DIR` overrides it (must be an absolute path, else `SystemExit`); `tools/make_fixture.py` builds a throwaway one to test against.
-`import_state.json` and the default `taxonomy.txt` live at `{library_root}/` (alongside PDFs, not in app data dir).
+`import_state.json`, the default `taxonomy.txt`, and `taxa.txt` (always beside the taxonomy file) live at `{library_root}/` (alongside PDFs, not in app data dir).
 
 ---
 
@@ -108,9 +113,11 @@ paperbase/
 │   ├── categoriser.py # EmbeddingCategoriser + CategorizationWorker
 │   ├── vectors.py     # VectorStore: persistent paper embeddings
 │   ├── taxonomy.py    # Label; parse/load/save the hand-edited taxonomy file
-│   ├── assign.py      # top_labels: chunked cosine assignment, pure numpy
+│   ├── taxa.py        # TaxonTree: parse taxa.txt; lexical taxon matching
+│   ├── assign.py      # labels_above: chunked cosine assignment, pure numpy
 │   ├── keywords.py    # extract_keywords: YAKE plus stop-token and overlap filters
 │   ├── backfill.py    # HashBackfillWorker: fills content_hash on pre-hash rows
+│   ├── dedupe.py      # DedupeWorker: removes hash duplicates, merging onto the keeper
 │   └── llm.py         # Dead code — thin adapter over EmbeddingCategoriser, not imported anywhere
 └── models/
     ├── paper.py
@@ -147,7 +154,9 @@ CREATE TABLE IF NOT EXISTS papers (
     open_access     INTEGER NOT NULL DEFAULT 0,
     isbn            TEXT,                        -- ISBN-13 preferred; populated for books
     document_type   TEXT NOT NULL DEFAULT 'article',
-    content_hash    TEXT                         -- SHA-256 of PDF bytes; NULL pre-backfill
+    content_hash    TEXT,                        -- SHA-256 of PDF bytes; NULL pre-backfill
+    taxa            TEXT NOT NULL DEFAULT '[]',  -- JSON array: most specific taxon names
+    taxa_locked     INTEGER NOT NULL DEFAULT 0   -- 1 once taxa are hand-edited; runs skip it
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -203,6 +212,8 @@ class Paper:
     isbn: Optional[str] = None        # keyword default — keeps construction sites without it valid
     document_type: str = 'article'
     content_hash: Optional[str] = None   # SHA-256 of the PDF bytes; None on pre-backfill rows
+    taxa: list[str] = field(default_factory=list)  # most specific taxon names
+    taxa_locked: bool = False            # set by a hand edit; categorisation leaves taxa alone
 
 @dataclass
 class SearchResult:
@@ -399,16 +410,20 @@ written one flush at a time (`_append_state(items: list[str])`, one file open pe
 ## Auto-Categorisation (`core/categoriser.py`)
 
 - `EmbeddingCategoriser`: owned by `MainWindow`, shared (with `threading.Lock`) to `ImportDialog` and `CategorizationDialog`.
-- `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and `has_categories` (free-text categories or taxonomy labels).
-- `categorise_papers(papers, db, vector_store=None)` returns one `(collection_ids, tags)` pair
-  per input paper, positionally, to **merge onto** that paper, never replace. Collections are
-  the union of free-text category matches and at most `top_k` taxonomy labels, both against
-  the one threshold; tags are YAKE (`core/keywords.py`) and need no model. Given a
-  `vector_store`, it persists each paper's embedding from the same batched encode, which is how
-  the importer stores vectors without a second model call. It creates missing top-level
-  collections through `_resolve_collections`, one `get_collections()` per batch. Prefer it to
-  `categorise_paper`, which survives only as a single-paper wrapper: on CPU one `encode` over
-  64 texts costs little more than one over a single document. `_BATCH_SIZE` is 64.
+- `load_model()` is blocking — always call from a worker thread or daemon thread. `MainWindow` preloads at startup if `auto_categorise=True` and `has_embedding_targets` (free-text categories or taxonomy labels; taxa need no model).
+- `categorise_papers(papers, db, vector_store=None)` returns one `(collection_ids,
+  tags, taxa)` triple per input paper, positionally. Collections and tags **merge onto**
+  the paper, never replace; taxa replace the stored ones unless `taxa_locked`.
+  Collections are the union of free-text category matches and every taxonomy label at or
+  above the one threshold (no per-paper cap; `tools/label_stats.py` calibrates it),
+  keeping only the most specific label on each path (`most_specific_labels`); tags are
+  YAKE (`core/keywords.py`) and taxa come from `TaxonTree.match`, and neither needs
+  the model. Given a `vector_store`, it persists each paper's embedding from the same
+  batched encode, which is how the importer stores vectors without a second model call. It
+  creates every missing collection along each label's path through `_resolve_collections`,
+  one `get_collections()` per batch. Prefer it to `categorise_paper`, which survives only
+  as a single-paper wrapper: on CPU one `encode` over 64 texts costs little more than one
+  over a single document. `_BATCH_SIZE` is 64.
 - The merge uses `sorted(set(...))`, not `list(set(...))`: comparing an unordered
   `list(set(...))` against `paper.collection_ids` reports a change whenever the ordering
   differs and writes a row that did not need writing.
@@ -424,11 +439,22 @@ written one flush at a time (`_append_state(items: list[str])`, one file open pe
   vector until `Rebuild vectors`. Windows refuses to delete the blob while a `matrix()` memmap
   is alive, so `clear()` runs only with no worker holding one; the button is disabled during
   a run.
-- **Taxonomy** (`core/taxonomy.py`): a plain text file, `Name` or `Name: description` per
-  line, `{library_root}/taxonomy.txt` unless `taxonomy_path` is set; `Settings.taxonomy_file()`
-  is the one resolution rule. Bad lines are skipped with a warning; an unreadable file raises
+- **Taxonomy** (`core/taxonomy.py`): a plain text file, `Name` or `Parent > Name` (deeper
+  allowed, a parent on an earlier line), each optionally `: description`, one per line;
+  each label's collection nests under its parent's; `{library_root}/taxonomy.txt` unless
+  `taxonomy_path` is set; `Settings.taxonomy_file()` is the one resolution rule. Bad lines are skipped with a warning; an unreadable file raises
   `TaxonomyError`, which every caller catches, since `MainWindow` loads it during construction.
   No starter taxonomy ships; `tools/seed_taxonomy.py` drafts one on the target machine.
+- **Taxa** (`core/taxa.py`): `taxa.txt` beside the taxonomy file (`Settings.taxa_file()`),
+  `Parent > Name: alias, alias` per line, `Name [informal]` for non-monophyletic groupings.
+  Matched lexically, never embedded: whole words in title, abstract and keywords, names and
+  capitalised aliases in exact case (or full capitals at 6+ letters), lowercase aliases in
+  singular or plural, longest form first. Only the most specific taxa are stored in
+  `papers.taxa`; the sidebar and `search_filter(taxa=...)` resolve descendants from the tree.
+  A categorisation run replaces taxa unless `taxa_locked`, which any hand edit in the paper
+  panel sets and `Unlock` clears. Aliases must be unique and free of common non-taxon senses
+  ("rays", "seals", "moles", "hedgehogs" all fail); `tools/label_stats.py` lists the most
+  frequent taxa, where a noisy alias shows itself.
 - Model: `all-MiniLM-L6-v2` (~23 MB, cached in `~/.cache/torch/sentence_transformers/`). Do NOT switch to Qwen3-Embedding-0.6B (27× slower on CPU). Quality upgrade path: `BAAI/bge-small-en-v1.5`.
 - CPU-only by design. Install `torch` from PyPI, whose default Windows wheel is the CPU
   build. A CUDA build buys nothing on a GTX 1050 Ti: PyTorch dropped Pascal (`sm_61`) from
@@ -438,10 +464,10 @@ written one flush at a time (`_append_state(items: list[str])`, one file open pe
   cores, so the CPU build is sufficient for everything here.
 - Retroactive batch: `CategorizationWorker(QThread)` runs two stages. `embedding` encodes the
   papers the vector store lacks (the store's id map is the resume record; there is no separate
-  state file), and `assigning` runs `assign.top_labels` over `store.matrix()` in one pass plus
-  YAKE per paper, re-run in full every time because it is idempotent and takes minutes. With
-  no model it skips `embedding` and still tags. `ImportWorker` categorises only when the model
-  is loaded, so papers imported without one wait for this run.
+  state file), and `assigning` runs `assign.labels_above` over `store.matrix()` in one pass plus
+  YAKE and the taxon matcher per paper, re-run in full every time because it is idempotent and
+  takes minutes. With no model it skips `embedding` and still tags. Without a loaded model
+  `ImportWorker` still applies keyword tags and taxa; collections wait for this run.
 - `core/llm.py` is dead code — do not import it.
 
 ---
@@ -475,6 +501,15 @@ sits in the Papers panel's header slot via `GlassPanel.add_header_widget`.
 - Tags: clickable chips (`QPushButton#TagChip`), removed by clicking; `QLineEdit` below to add.
 - Changes saved on `editingFinished` (focus-out or Enter) — single `UPDATE`, no debounce.
 - Deleting a collection removes its ID from all `papers.collection_ids` arrays; does not delete papers.
+- The Library tree holds a `Taxa` branch between Collections and Tags, absent without a
+  `taxa.txt`: only taxa a paper holds (or holds below), informal groupings in italic.
+  `taxa.txt` nests up to 21 ranks, which indents past the panel's edge, so an unbranched run
+  of ranks no paper stores folds into one row named for its last taxon (`_add_taxa`; the
+  folded path is the tooltip). It opens one level plus any sole child, and keeps open
+  branches across the `refresh()` every paper edit triggers. Selecting a taxon filters to it
+  and every descendant. The paper panel's `Taxa` chips accept only names from `taxa.txt`
+  (a refused name gets a red border and a line saying why); a hand edit sets
+  `taxa_locked`, shown as a note with an `Unlock` button.
 - `needs_review` is shown as an amber chip plus an amber left border on the four fields the
   guessing pipeline fills (title, authors, journal, year), never as a banner.
 - The results panel is a `QStackedWidget`: table, loading, empty library, no query match, no
@@ -489,9 +524,12 @@ sits in the Papers panel's header slot via `GlassPanel.add_header_widget`.
   panel (status line, bar, capped log) over a `Duplicates` report whose three states are all
   designed — nothing scanned, no duplicates (lime), and the groups list. Its end-state bar
   shows actual coverage rather than 100%, or a run where every file was unreadable would read
-  as a clean finish. Nothing in it deletes, merges or edits a paper, and it says so on its
-  face: which copy to keep depends on file quality and folder placement, which no rule here
-  can judge.
+  as a clean finish. `Remove duplicates` (red, disabled until a scan finds groups, confirmed) runs
+  `core/dedupe.py`'s `DedupeWorker`: one copy per group survives, chosen by `choose_keeper`
+  (not needs-review, best `metadata_source`, not in `Unsorted/`, lowest id); the rest are deleted
+  from the DB, the index and disk, with tags, collections, taxa and the taxa lock merged onto
+  the keeper. A file is
+  unlinked only after it and the keeper re-hash to the group digest.
 - The Import dialog shows one amber line when coverage is incomplete, and nothing at all when
   it is complete. That gap is the one place the missing fingerprints cost the user something.
 
@@ -561,7 +599,11 @@ them, one accent hue per region. Tokens live as module constants in `paperbase/u
 
 ## PyQt6 Gotchas
 
-- `QFlowLayout` doesn't exist. Tag chips use `QHBoxLayout(AlignLeft)`.
+- `QFlowLayout` doesn't exist. Tag and taxon chips use `_ChipFlow` (`ui/paper_detail.py`), a
+  `heightForWidth` layout that wraps them; a single `QHBoxLayout` row squeezed four chips
+  until each clipped its own name.
+- A `QPushButton` given a fixed width under 40px shows no label: the theme pads buttons
+  16px a side.
 - Drag from `QTableView`: must implement `flags()` (+`ItemIsDragEnabled`), `mimeTypes()`, `mimeData()` on the model. `setDragEnabled(True)` alone does nothing.
 - Drop onto `QTreeView`: subclass + override `dragEnterEvent`/`dragMoveEvent`/`dropEvent`. Use `event.position().toPoint()` (not `event.pos()`).
 - MIME type for drag-drop: `application/x-paperbase-paper-ids` (comma-separated IDs, UTF-8).
@@ -589,7 +631,7 @@ all 5, and `tools/check_phase5.py` counts every one of those calls.
 
 **Nothing heavy before the first paint:** `MainWindow.__init__` only builds widgets. `main.py` calls `window.show()` then `window.start_deferred_load()`, which stages the listing, the collection tree, and the categoriser preload behind `QTimer.singleShot`. `CollectionTree.__init__` deliberately does not call `refresh()`. `SearchPanel._apply_filters` returns early until `_loaded`, or the sort Qt triggers during construction runs a full-library query before the window is up.
 
-**A `QScrollArea` with the horizontal bar off clips instead of scrolling.** In `PaperDetail` the tag chips are one `QHBoxLayout` (Qt has no flow layout), so their width would otherwise become the whole form's minimum and silently cut the right-hand edge off every field. `_tags_container.setMinimumWidth(1)` makes the chips give first. Watch for this with any unbounded row added to that form.
+**A `QScrollArea` with the horizontal bar off clips instead of scrolling.** In `PaperDetail` the widest tag or taxon chip would otherwise become the whole form's minimum and silently cut the right-hand edge off every field. `setMinimumWidth(1)` on both chip containers makes the chip give first. Watch for this with any unbounded row added to that form.
 
 **Table columns must add up:** the results table's Title column is `QHeaderView.ResizeMode.Stretch` and the other four are fixed, so the five always fit the panel. Fixed widths for all five overflowed and pushed Year and Score out of sight.
 
@@ -657,10 +699,10 @@ sentence-transformers nor a display: every categoriser test installs `FakeModel`
 `_load_sentence_transformer` seam, and worker tests call `QThread.run()` directly, which works
 with no `QApplication` and no event loop. `pytest-qt` is a dev placeholder.
 
-The `tools/check_*.py` scripts listed under Commands are the behavioural checks for the import
-path: each does its own `sys.path.insert`, runs against a throwaway `tempfile.mkdtemp()`
-fixture, prints one `OK` line and exits 0. Run all eight, and the pytest suite, after touching
-the import, metadata, dedupe or categorisation paths.
+The `tools/check_*.py` scripts listed under Commands are the behavioural checks: each does its
+own `sys.path.insert`, runs against a throwaway `tempfile.mkdtemp()` fixture, prints one `OK`
+line and exits 0. Run all ten, and the pytest suite, after touching the import, metadata,
+dedupe, categorisation or taxa paths.
 
 Every check must point `PAPERBASE_DATA_DIR` at a throwaway path, never at the real data
 directory, and must `db.close()` before its `TemporaryDirectory` exits: Windows holds the

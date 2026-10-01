@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from paperbase.core.taxonomy import (
-    MAX_LABELS,
     MAX_NAME,
     Label,
     TaxonomyError,
@@ -52,10 +51,10 @@ def test_invalid_lines_skipped() -> None:
     assert [label.name for label in labels] == ["Ecology", "Genetics"]
 
 
-def test_cap_enforced() -> None:
+def test_no_label_cap() -> None:
     text = "\n".join(f"Label{i}" for i in range(2500))
     labels = parse_taxonomy(text)
-    assert len(labels) == MAX_LABELS
+    assert len(labels) == 2500
 
 
 def test_round_trip(tmp_path: Path) -> None:
@@ -77,3 +76,40 @@ def test_missing_file_returns_empty(tmp_path: Path) -> None:
 def test_directory_raises(tmp_path: Path) -> None:
     with pytest.raises(TaxonomyError):
         load_taxonomy(tmp_path)
+
+
+def test_hierarchy_parsed() -> None:
+    text = (
+        "Palaeontology: fossils\n"
+        "Palaeontology > Taphonomy: decay\n"
+        "palaeontology > Ichnology\n"
+    )
+    labels = parse_taxonomy(text)
+    assert [label.path for label in labels] == [
+        ("Palaeontology",),
+        ("Palaeontology", "Taphonomy"),
+        ("Palaeontology", "Ichnology"),
+    ]
+    assert labels[1].description == "decay"
+
+
+def test_child_before_parent_skipped() -> None:
+    labels = parse_taxonomy("Evolution > Stasis\nEvolution\n")
+    assert [label.path for label in labels] == [("Evolution",)]
+
+
+def test_same_leaf_under_different_parents() -> None:
+    labels = parse_taxonomy("A\nB\nA > Methods\nB > Methods\n")
+    assert [label.path for label in labels] == [
+        ("A",), ("B",), ("A", "Methods"), ("B", "Methods"),
+    ]
+
+
+def test_hierarchy_round_trip(tmp_path: Path) -> None:
+    labels = [
+        Label(name="Evolution", description="theory"),
+        Label(name="Stasis", parents=("Evolution",)),
+    ]
+    path = tmp_path / "taxonomy.txt"
+    save_taxonomy(path, labels)
+    assert load_taxonomy(path) == labels

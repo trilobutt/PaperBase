@@ -1,17 +1,19 @@
 """
 Topic taxonomy: the plain-text label file the user hand-edits.
 
-150 to 300 topic labels have to be hand-edited, so they live in a plain text file the user
-owns rather than in `settings.json`. The file is untrusted input and is validated at the
-boundary: a bad line is logged and skipped rather than raised, because one bad line must not
-cost the user the other 299.
+Topic labels are hand-edited, so they live in a plain text file the user owns rather
+than in `settings.json`. The file is untrusted input and is validated at the boundary: a
+bad line is logged and skipped rather than raised, because one bad line must not cost
+the user every other label.
 
 File format, one label per line:
 
-- `Name` or `Name: description`. Only the first colon splits; colons inside a description are
-  kept.
+- `Name`, `Parent > Name`, or deeper, each optionally followed by `: description`. Only
+  the first colon splits; colons inside a description are kept.
+- A label's parent path must be a label defined on an earlier line. Each label becomes a
+  collection nested under its parent's.
 - Lines whose first non-space character is `#` are comments. Blank lines are ignored.
-- `Name` and `description` are stripped of surrounding whitespace.
+- Names and description are stripped of surrounding whitespace.
 """
 
 import logging
@@ -23,12 +25,12 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 MAX_NAME = 120
-MAX_LABELS = 2000
 
 _HEADER = """\
 # PaperBase topic taxonomy
 #
-# One label per line: `Name` or `Name: description`.
+# One label per line: `Name`, or `Parent > Name` for a nested label, optionally
+# followed by `: description`. A parent must appear on an earlier line.
 # Only the first colon splits a line; colons inside a description are kept.
 # Lines starting with '#' are comments and blank lines are ignored.
 # Name and description are stripped of surrounding whitespace.
@@ -50,10 +52,20 @@ class TaxonomyError(Exception):
 
 @dataclass(frozen=True)
 class Label:
-    """A single topic label, with an optional description used to steer embedding."""
+    """A single topic label, with an optional description used to steer embedding.
+
+    `parents` names the enclosing labels from the top level down, and is empty for a
+    top-level label. The label's collection nests under the collection of `parents`.
+    """
 
     name: str
     description: str = ""
+    parents: tuple[str, ...] = ()
+
+    @property
+    def path(self) -> tuple[str, ...]:
+        """`parents` plus `name`: the collection path this label resolves to."""
+        return self.parents + (self.name,)
 
     @property
     def text(self) -> str:
@@ -70,36 +82,26 @@ def parse_taxonomy(text: str) -> list[Label]:
         text: the raw file contents.
 
     Returns:
-        Valid, deduplicated labels, in file order, capped at `MAX_LABELS`.
+        Valid, deduplicated labels, in file order.
     """
     labels: list[Label] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, ...]] = set()
+    canonical: dict[tuple[str, ...], tuple[str, ...]] = {}
 
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
 
-        if len(labels) >= MAX_LABELS:
-            logger.warning(
-                "Taxonomy line %d: MAX_LABELS (%d) reached; ignoring remaining lines.",
-                lineno,
-                MAX_LABELS,
-            )
-            break
+        head, _, description = line.partition(":")
+        segments = [s.strip() for s in head.split(">")]
+        description = description.strip()
+        name = segments[-1]
 
-        if ":" in line:
-            name, description = line.split(":", 1)
-            name = name.strip()
-            description = description.strip()
-        else:
-            name = line
-            description = ""
-
-        if not name:
+        if not all(segments):
             logger.warning("Taxonomy line %d: empty name; skipping.", lineno)
             continue
-        if len(name) > MAX_NAME:
+        if any(len(s) > MAX_NAME for s in segments):
             logger.warning(
                 "Taxonomy line %d: name longer than MAX_NAME (%d); skipping.",
                 lineno,
@@ -107,13 +109,24 @@ def parse_taxonomy(text: str) -> list[Label]:
             )
             continue
 
-        key = name.casefold()
+        key = tuple(s.casefold() for s in segments)
         if key in seen:
             logger.warning("Taxonomy line %d: duplicate name %r; skipping.", lineno, name)
             continue
+        if len(key) > 1 and key[:-1] not in seen:
+            logger.warning(
+                "Taxonomy line %d: parent %r is not a label defined above; skipping.",
+                lineno,
+                " > ".join(segments[:-1]),
+            )
+            continue
 
+        # Parents are spelled as their own lines spell them, so a case slip in a child's
+        # path still lands it under the one existing collection.
+        parents = canonical[key[:-1]] if len(key) > 1 else ()
         seen.add(key)
-        labels.append(Label(name=name, description=description))
+        canonical[key] = parents + (name,)
+        labels.append(Label(name=name, description=description, parents=parents))
 
     return labels
 
@@ -153,8 +166,6 @@ def save_taxonomy(path: Path, labels: Sequence[Label]) -> None:
     """Write `labels` to `path`, one per line, preceded by a header documenting the format."""
     lines = [_HEADER]
     for label in labels:
-        if label.description:
-            lines.append(f"{label.name}: {label.description}")
-        else:
-            lines.append(label.name)
+        head = " > ".join(label.path)
+        lines.append(f"{head}: {label.description}" if label.description else head)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

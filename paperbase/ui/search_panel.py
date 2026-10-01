@@ -146,6 +146,7 @@ class SearchPanel(QWidget):
         self._indexer = indexer
         self._active_collection: Optional[int] = None
         self._active_tags: list[str] = []
+        self._active_taxa: Optional[list[str]] = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -401,6 +402,11 @@ class SearchPanel(QWidget):
             self._active_tags = []
         self._apply_filters()
 
+    def set_taxa_filter(self, taxa: Optional[list[str]]) -> None:
+        """Filter to papers holding any of `taxa`: a sidebar taxon plus its descendants."""
+        self._active_taxa = taxa or None
+        self._apply_filters()
+
     def refresh_tags(self) -> None:
         selected = {item.text() for item in self._tag_list.selectedItems()}
         self._tag_list.clear()
@@ -434,6 +440,7 @@ class SearchPanel(QWidget):
             year_to=year_to,
             journal=journal,
             tags=combined_tags,
+            taxa=self._active_taxa,
             collection_id=self._active_collection,
             needs_review_only=needs_review,
             document_type=document_type,

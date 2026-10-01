@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 
 from paperbase.core.db import Database
+from paperbase.core.taxa import load_taxa
 from paperbase.core.taxonomy import TaxonomyError, load_taxonomy
 from paperbase.ui import theme
 from paperbase.ui.glass import CanvasBackdrop, GlassPanel
@@ -31,7 +32,6 @@ class Settings:
         self.category_threshold: float = 0.35  # min cosine similarity to assign a category
         self.tag_count: int = 5                # keywords to extract per paper
         self.taxonomy_path: str = ""           # blank means {library_root}/taxonomy.txt
-        self.taxonomy_top_k: int = 4           # max taxonomy labels assigned per paper
         # Appearance
         self.reduce_motion: bool = False       # collapse every animation to an instant swap
 
@@ -46,6 +46,11 @@ class Settings:
             return Path(self.library_root) / "taxonomy.txt"
         return None
 
+    def taxa_file(self) -> Optional[Path]:
+        """The taxon tree: taxa.txt beside the resolved taxonomy file, or None."""
+        taxonomy = self.taxonomy_file()
+        return taxonomy.with_name("taxa.txt") if taxonomy is not None else None
+
     def save(self, path: Path) -> None:
         data = {
             "version": SETTINGS_VERSION,
@@ -59,7 +64,6 @@ class Settings:
             "category_threshold": self.category_threshold,
             "tag_count": self.tag_count,
             "taxonomy_path": self.taxonomy_path,
-            "taxonomy_top_k": self.taxonomy_top_k,
             "reduce_motion": self.reduce_motion,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -80,7 +84,6 @@ class Settings:
                 s.category_threshold = float(data.get("category_threshold", 0.35))
                 s.tag_count = int(data.get("tag_count", 5))
                 s.taxonomy_path = data.get("taxonomy_path", "")
-                s.taxonomy_top_k = int(data.get("taxonomy_top_k", 4))
                 s.reduce_motion = bool(data.get("reduce_motion", False))
             except Exception:
                 pass
@@ -249,7 +252,10 @@ class SettingsDialog(QDialog):
         taxonomy_file = self._settings.taxonomy_file()
         # A no-break space keeps the format example whole; wrapped after the colon it
         # reads as two separate words.
-        file_format = "One label per line, as Name or Name:\u00a0description."
+        file_format = (
+            "One label per line, as Name or Parent\u00a0>\u00a0Name, "
+            "with an optional :\u00a0description."
+        )
         seed_hint = "tools/seed_taxonomy.py drafts a fresh one from your tags and keywords."
         unreadable = False
         if taxonomy_file is None or not taxonomy_file.exists():
@@ -290,15 +296,55 @@ class SettingsDialog(QDialog):
             taxonomy_note.setObjectName("FieldNote")
         taxonomy_col.addWidget(taxonomy_note)
         cat_form.addRow("Taxonomy file:", taxonomy_row)
-
-        self._top_k_spin = QSpinBox()
-        self._top_k_spin.setRange(1, 10)
-        self._top_k_spin.setValue(self._settings.taxonomy_top_k)
-        self._top_k_spin.setToolTip(
-            "The most taxonomy labels a single paper can be assigned.\n"
-            "A paper gets fewer when fewer labels clear the assignment threshold."
-        )
-        cat_form.addRow("Labels per paper:", self._top_k_spin)
+        # The taxon tree has no path field of its own: it is taxa.txt beside the taxonomy
+        # file, wherever that is, so this row only reports what that file holds.
+        taxa_file = self._settings.taxa_file()
+        taxa_unreadable = False
+        if taxa_file is None or not taxa_file.exists():
+            taxa_note_text = (
+                "No taxa.txt beside the taxonomy file, so papers get no taxa. One taxon "
+                "per line, as Parent\u00a0>\u00a0Name:\u00a0alias,\u00a0alias."
+            )
+        else:
+            try:
+                taxon_count = len(load_taxa(taxa_file))
+            except TaxonomyError as exc:
+                taxa_unreadable = True
+                taxa_note_text = f"taxa.txt {exc.reason}, so no taxa are assigned from it."
+            else:
+                held_taxa = (
+                    "no taxa yet" if taxon_count == 0
+                    else "1 taxon" if taxon_count == 1
+                    else f"{taxon_count:,} taxa"
+                )
+                taxa_note_text = (
+                    f"taxa.txt beside the taxonomy file holds {held_taxa}, matched by name "
+                    "and alias in each paper's title, abstract, and keywords."
+                )
+        taxa_note = QLabel(taxa_note_text)
+        taxa_note.setWordWrap(True)
+        if taxa_unreadable:
+            taxa_note.setStyleSheet(
+                f"color: {theme.TEXT_PRIMARY};"
+                f"border-left: 2px solid {theme.ACCENT_AMBER};"
+                f"padding-left: {theme.SPACE}px;"
+            )
+        else:
+            taxa_note.setObjectName("FieldNote")
+        # In a column of its own, as the taxonomy note is: a wrapped label given a form row
+        # directly is handed a height for the wrong width.
+        taxa_row = QWidget()
+        taxa_col = QVBoxLayout(taxa_row)
+        # One unit of extra air above, on the note and its label alike: at the form's own
+        # spacing, two notes in a row read as one paragraph about the taxonomy file.
+        taxa_col.setContentsMargins(0, theme.SPACE, 0, 0)
+        taxa_col.addWidget(taxa_note)
+        # Top-aligned by hand: the form centres a label against a field this short, which
+        # set it between the note's two lines instead of level with the first.
+        taxa_label = QLabel("Taxon tree:")
+        taxa_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        taxa_label.setContentsMargins(0, theme.SPACE, 0, 0)
+        cat_form.addRow(taxa_label, taxa_row)
 
         cat_layout.addLayout(cat_form)
 
@@ -531,7 +577,6 @@ class SettingsDialog(QDialog):
         self._settings.category_threshold = self._threshold_spin.value()
         self._settings.tag_count = self._tag_count_spin.value()
         self._settings.taxonomy_path = self._taxonomy_edit.text().strip()
-        self._settings.taxonomy_top_k = self._top_k_spin.value()
         self._settings.reduce_motion = self._reduce_motion_check.isChecked()
         # Applied here rather than by the caller: every animation in the application asks
         # theme at the moment it would start, so the box takes effect on OK without a

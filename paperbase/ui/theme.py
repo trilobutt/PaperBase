@@ -205,6 +205,11 @@ QLabel#FieldNote {
     color: ${TEXT_SECONDARY};
 }
 
+/* Why an entry was refused, under the field it refused. */
+QLabel#FieldError {
+    color: ${ACCENT_RED};
+}
+
 /* Fixed-width output: the import and categorisation logs, where the columns are
    the medium. The only monospace in the application outside them. */
 #LogView {
@@ -277,6 +282,12 @@ QComboBox:disabled {
 QLineEdit[review="true"],
 QSpinBox[review="true"] {
     border-left-color: ${ACCENT_AMBER};
+}
+
+/* A hand-typed taxon that taxa.txt does not hold. Red, since the entry was refused, and
+   on the whole border, since nothing was saved. */
+QLineEdit[invalid="true"] {
+    border-color: ${ACCENT_RED};
 }
 
 /* The spin-box stepper sub-controls and the combo-box drop-down are

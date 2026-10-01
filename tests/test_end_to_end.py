@@ -67,10 +67,10 @@ def test_full_pipeline(db, store_path, tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(categoriser, "_load_sentence_transformer", lambda name: model)
 
     cat = EmbeddingCategoriser()
-    # threshold=-1.0: cosine similarity never falls below it, so every paper matches its
-    # top_k=3 closest labels regardless of FakeModel's vectors carrying real semantic
-    # structure, the same device test_categoriser.py uses for a deterministic match.
-    cat.update_settings(categories=[], threshold=-1.0, tag_count=5, labels=labels, top_k=3)
+    # threshold=-1.0: cosine similarity never falls below it, so every paper matches every
+    # label regardless of FakeModel's vectors carrying real semantic structure, the same
+    # device test_categoriser.py uses for a deterministic match.
+    cat.update_settings(categories=[], threshold=-1.0, tag_count=5, labels=labels)
     cat.load_model()
 
     # 4. Vector store and worker, run synchronously (QThread.run() called directly).
@@ -86,9 +86,10 @@ def test_full_pipeline(db, store_path, tmp_path, monkeypatch) -> None:
         updated = db.get_paper(paper.id)
         assert updated is not None
         assert updated.tags, f"paper {paper.id} got no tags"
-        assert len(updated.collection_ids) <= 3, (
-            f"paper {paper.id} has {len(updated.collection_ids)} collections, "
-            "more than top_k=3"
+        # No per-paper cap: every label matches, and all six are top-level, so each
+        # paper lands in all six collections.
+        assert len(updated.collection_ids) == len(TAXONOMY_LABELS), (
+            f"paper {paper.id} has {len(updated.collection_ids)} collections"
         )
 
     collections = db.get_collections()

@@ -3,9 +3,10 @@ Embedding-based auto-categorisation and keyword tagging.
 
 Uses sentence-transformers (all-MiniLM-L6-v2, ~23 MB, CPU-friendly) for category
 assignment: cosine similarity between a paper's embedding and either user-defined
-free-text category descriptions or a fixed taxonomy (paperbase.core.taxonomy). Both
+free-text category descriptions or a hierarchical taxonomy (paperbase.core.taxonomy). Both
 assign papers to matching collections in the DB. Tag extraction uses YAKE
-(paperbase.core.keywords) and needs no model at all.
+(paperbase.core.keywords) and taxon assignment the lexical matcher in paperbase.core.taxa,
+and neither needs a model at all.
 
 sentence-transformers is optional at import time; it is loaded lazily inside
 load_model(). If not installed the categoriser returns empty results silently.
@@ -18,9 +19,10 @@ from typing import Optional
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from paperbase.core.assign import top_labels
+from paperbase.core.assign import labels_above
 from paperbase.core.db import Database
 from paperbase.core.keywords import extract_keywords
+from paperbase.core.taxa import TaxonTree
 from paperbase.core.taxonomy import Label
 from paperbase.core.vectors import VectorStore
 from paperbase.models.collection import Collection
@@ -47,6 +49,15 @@ def paper_text(paper: Paper) -> str:
     return f"{paper.title}. {paper.abstract}".strip(" .")
 
 
+def taxa_text(paper: Paper) -> str:
+    """The text a paper's taxa are matched in: title, abstract, then keywords.
+
+    Joined with " ; " so no multi-word taxon form can match across the end of one field
+    and the start of the next.
+    """
+    return " ; ".join([paper.title, paper.abstract, *paper.keywords])
+
+
 class EmbeddingCategoriser:
     MODEL_NAME = "all-MiniLM-L6-v2"
 
@@ -60,7 +71,7 @@ class EmbeddingCategoriser:
         self._tag_count: int = 5
         self._labels: list[Label] = []
         self._label_matrix: Optional[np.ndarray] = None
-        self._top_k: int = 4
+        self._taxa: TaxonTree = TaxonTree([])
 
     @property
     def is_loaded(self) -> bool:
@@ -68,7 +79,17 @@ class EmbeddingCategoriser:
 
     @property
     def has_categories(self) -> bool:
+        """Anything at all to assign: free-text categories, topic labels, or taxa."""
+        return bool(self._categories) or bool(self._labels) or len(self._taxa) > 0
+
+    @property
+    def has_embedding_targets(self) -> bool:
+        """Whether assignment needs the model: taxa are matched lexically and need none."""
         return bool(self._categories) or bool(self._labels)
+
+    @property
+    def taxa(self) -> TaxonTree:
+        return self._taxa
 
     @property
     def has_labels(self) -> bool:
@@ -84,10 +105,6 @@ class EmbeddingCategoriser:
     @property
     def threshold(self) -> float:
         return self._threshold
-
-    @property
-    def top_k(self) -> int:
-        return self._top_k
 
     @property
     def tag_count(self) -> int:
@@ -119,15 +136,15 @@ class EmbeddingCategoriser:
         threshold: float,
         tag_count: int,
         labels: Optional[list[Label]] = None,
-        top_k: int = 4,
+        taxa: Optional[TaxonTree] = None,
     ) -> None:
-        """Update categories, taxonomy labels and parameters. Recomputes embeddings and the
+        """Update categories, topic labels, taxa and parameters. Recomputes embeddings and the
         label matrix if the model is loaded."""
         self._categories = categories
         self._threshold = threshold
         self._tag_count = tag_count
         self._labels = list(labels) if labels else []
-        self._top_k = top_k
+        self._taxa = taxa if taxa is not None else TaxonTree([])
         if self._model is not None:
             with self._lock:
                 self._recompute_embeddings()
@@ -179,7 +196,9 @@ class EmbeddingCategoriser:
         sims = cat_matrix @ vector
         return [n for n, s in zip(names, sims) if s >= self._threshold]
 
-    def categorise_paper(self, paper: Paper, db: Database) -> tuple[list[int], list[str]]:
+    def categorise_paper(
+        self, paper: Paper, db: Database
+    ) -> tuple[list[int], list[str], list[str]]:
         """Single-paper wrapper. Prefer categorise_papers: the model call costs nearly the
         same for one document as for a batch of 64."""
         return self.categorise_papers([paper], db)[0]
@@ -189,14 +208,17 @@ class EmbeddingCategoriser:
         papers: list[Paper],
         db: Database,
         vector_store: Optional[VectorStore] = None,
-    ) -> list[tuple[list[int], list[str]]]:
+    ) -> list[tuple[list[int], list[str], list[str]]]:
         """Categorise a batch in one model pass.
 
-        Returns one (collection_ids, tags) pair per input paper, positionally, to merge onto
-        that paper. Creates any missing top-level collections. Tags come from YAKE and need no
-        model. When vector_store is given, every live paper's own embedding is persisted into
-        it as part of this same batched encode, so a caller never has to encode a second time
-        just to store what this method already computed.
+        Returns one (collection_ids, tags, taxa) triple per input paper, positionally.
+        Collections and tags are to be merged onto the paper; taxa replace its taxa unless
+        the paper's taxa are locked, which the caller checks. Creates every missing
+        collection along each matched label's path, and keeps only the most specific
+        label on any path. Tags come from YAKE and taxa from the lexical taxon matcher;
+        neither needs the model. When vector_store is given, every live paper's own
+        embedding is persisted into it as part of this same batched encode, so a caller
+        never has to encode a second time just to store what this method already computed.
         """
         if not papers:
             return []
@@ -206,14 +228,16 @@ class EmbeddingCategoriser:
             kw_text = p.abstract or p.title
             if kw_text:
                 tags_by_idx[i] = extract_keywords(kw_text, top=self._tag_count)
+        taxa_by_idx = [self._taxa.match(taxa_text(p)) for p in papers]
+        bare = [([], tags_by_idx.get(i, []), taxa_by_idx[i]) for i in range(len(papers))]
 
         if self._model is None:
-            return [([], tags_by_idx.get(i, [])) for i in range(len(papers))]
+            return bare
 
         texts = [paper_text(p) for p in papers]
         live = [i for i, t in enumerate(texts) if t]
         if not live:
-            return [([], tags_by_idx.get(i, [])) for i in range(len(papers))]
+            return bare
 
         matched: dict[int, list[str]] = {}
         label_hits: dict[int, list[int]] = {}
@@ -241,51 +265,77 @@ class EmbeddingCategoriser:
                 for row, paper_idx in enumerate(live):
                     matched[paper_idx] = [n for n, hit in zip(names, hits[row]) if hit]
 
+            labels = self._labels
             if self._label_matrix is not None:
-                assignments = top_labels(
-                    doc_embs, self._label_matrix, self._threshold, self._top_k
-                )
+                assignments = labels_above(doc_embs, self._label_matrix, self._threshold)
                 for row, paper_idx in enumerate(live):
-                    label_hits[paper_idx] = [i for i, _score in assignments[row]]
+                    label_hits[paper_idx] = most_specific_labels(
+                        [i for i, _score in assignments[row]], labels
+                    )
 
         # DB work outside the lock, and one get_collections() for the whole batch rather than
         # once per paper: free-text categories and taxonomy labels share the same resolve call.
-        wanted_names = {n for ns in matched.values() for n in ns}
-        label_name_by_index = {
-            i: self._labels[i].name for i in {j for js in label_hits.values() for j in js}
-            if 0 <= i < len(self._labels)
-        }
-        wanted_names |= set(label_name_by_index.values())
-        col_by_name = _resolve_collections(wanted_names, db)
+        wanted: set[tuple[str, ...]] = {(n,) for ns in matched.values() for n in ns}
+        wanted |= {labels[i].path for hits in label_hits.values() for i in hits}
+        col_by_path = _resolve_collections(wanted, db)
 
-        results: list[tuple[list[int], list[str]]] = []
+        results: list[tuple[list[int], list[str], list[str]]] = []
         for i in range(len(papers)):
-            col_ids = [col_by_name[n] for n in matched.get(i, []) if n in col_by_name]
-            for label_idx in label_hits.get(i, []):
-                name = label_name_by_index.get(label_idx)
-                if name and name in col_by_name:
-                    col_ids.append(col_by_name[name])
-            results.append((sorted(set(col_ids)), tags_by_idx.get(i, [])))
+            paths = [(n,) for n in matched.get(i, [])]
+            paths += [labels[j].path for j in label_hits.get(i, [])]
+            col_ids = {col_by_path[p] for p in paths if p in col_by_path}
+            results.append((sorted(col_ids), tags_by_idx.get(i, []), taxa_by_idx[i]))
         return results
 
 
-def _resolve_collections(names: set[str], db: Database) -> dict[str, int]:
-    """Map top-level collection names to ids, creating any that are missing.
+def _resolve_collections(
+    paths: set[tuple[str, ...]], db: Database
+) -> dict[tuple[str, ...], int]:
+    """Map collection paths to ids, creating every missing collection along each path.
 
-    One `get_collections()` for the whole batch: the per-paper version read the entire
+    A path runs from the top level down: ("Palaeontology", "Taphonomy & Lagerstätten")
+    resolves the child under the top-level parent, creating whichever does not exist yet.
+    One get_collections() for the whole batch: the per-paper version read the entire
     collections table once per matched category.
     """
-    existing = {c.name: c.id for c in db.get_collections() if c.parent_id is None}
-    resolved: dict[str, int] = {}
-    for name in names:
-        if name in existing:
-            resolved[name] = existing[name]  # type: ignore[assignment]
-            continue
-        try:
-            resolved[name] = db.insert_collection(Collection(id=None, name=name, parent_id=None))
-        except Exception as e:
-            logger.error("Failed to create collection '%s': %s", name, e)
-    return resolved
+    by_key = {(c.name, c.parent_id): c.id for c in db.get_collections()}
+    resolved: dict[tuple[str, ...], int] = {}
+    for path in sorted(paths, key=len):
+        parent_id: Optional[int] = None
+        for depth in range(1, len(path) + 1):
+            prefix = path[:depth]
+            if prefix in resolved:
+                parent_id = resolved[prefix]
+                continue
+            key = (path[depth - 1], parent_id)
+            col_id = by_key.get(key)
+            if col_id is None:
+                try:
+                    col_id = db.insert_collection(
+                        Collection(id=None, name=path[depth - 1], parent_id=parent_id)
+                    )
+                except Exception as e:
+                    logger.error("Failed to create collection '%s': %s", " > ".join(prefix), e)
+                    break
+                by_key[key] = col_id
+            resolved[prefix] = col_id
+            parent_id = col_id
+    return {p: resolved[p] for p in paths if p in resolved}
+
+
+def most_specific_labels(indices: list[int], labels: list[Label]) -> list[int]:
+    """`indices` minus any label whose path is a proper prefix of another's, order kept.
+
+    Only the deepest matched label on each path is stored on a paper: its collection
+    already sits under every ancestor's, and filtering by an ancestor collection includes
+    its descendants (`Database._ancestor_and_self`). Out-of-range indices are dropped.
+    """
+    valid = [i for i in indices if 0 <= i < len(labels)]
+    paths = [labels[i].path for i in valid]
+    return [
+        i for i, path in zip(valid, paths)
+        if not any(len(p) > len(path) and p[: len(path)] == path for p in paths)
+    ]
 
 
 class CategorizationWorker(QThread):
@@ -295,8 +345,9 @@ class CategorizationWorker(QThread):
     Stage "embedding" encodes every paper the vector store does not already hold and
     persists the vectors; stage "assigning" derives collection and tag assignments from
     those vectors and merges them (never replaces) onto each paper's existing
-    collection_ids and tags. The vector store's id map is the resume record for the
-    expensive stage, so no separate state file is written or read.
+    collection_ids and tags, and replaces each paper's taxa unless they are locked. The
+    vector store's id map is the resume record for the expensive stage, so no separate
+    state file is written or read.
     """
 
     progress = pyqtSignal(int, int)   # done, total
@@ -337,9 +388,13 @@ class CategorizationWorker(QThread):
         self._categoriser.load_model()
         if not self._categoriser.is_loaded:
             self.log_message.emit(
-                "Model failed to load; collections cannot be assigned. Keyword "
-                "extraction needs no model and will still run."
+                "Model failed to load; collections cannot be assigned. Keyword and "
+                "taxon tagging need no model and will still run."
             )
+        self.log_message.emit(
+            f"{len(self._categoriser.labels):,} topic labels and "
+            f"{len(self._categoriser.taxa):,} taxa loaded."
+        )
 
         all_ids = self._db.get_all_paper_ids()
         embedded = 0
@@ -418,22 +473,25 @@ class CategorizationWorker(QThread):
         return embedded
 
     def _run_assigning_stage(self, all_ids: list[int]) -> int:
-        """Merge label/category collections and keyword tags onto every paper.
+        """Merge collections and keyword tags onto every paper, and replace its taxa.
 
-        Returns the count of papers whose row actually changed.
+        Collections and tags are merged, never replaced. Taxa are recomputed from the
+        current taxon tree and replace the stored ones, so an edited taxa.txt leaves no
+        orphans, except on a paper whose taxa were edited by hand (taxa_locked), which is
+        left alone. Returns the count of papers whose row actually changed.
         """
         matrix, row_ids = self._store.matrix()
         row_index = {pid: i for i, pid in enumerate(row_ids)}
 
         # Labels and their matrix are read once, together, so an index from one always
-        # names a row of the other even if Settings replaces the taxonomy mid-run.
+        # names a row of the other even if Settings replaces the taxonomy mid-run. The
+        # taxon tree is immutable, so one reference serves the whole run.
         labels = self._categoriser.labels
         label_matrix = self._categoriser.label_matrix()
+        taxa = self._categoriser.taxa
         assignments: list[list[tuple[int, float]]] = []
         if labels and label_matrix is not None and len(label_matrix) == len(labels):
-            assignments = top_labels(
-                matrix, label_matrix, self._categoriser.threshold, self._categoriser.top_k
-            )
+            assignments = labels_above(matrix, label_matrix, self._categoriser.threshold)
 
         total = len(all_ids)
         done = 0
@@ -453,51 +511,51 @@ class CategorizationWorker(QThread):
             # collection resolution below is one get_collections() for the whole chunk
             # rather than one per paper, which at 150k papers is the same cost the
             # per-paper predecessor of categorise_papers paid.
-            matched_labels: dict[int, list[str]] = {}
-            matched_categories: dict[int, list[str]] = {}
-            wanted_names: set[str] = set()
+            matched_paths: dict[int, list[tuple[str, ...]]] = {}
+            wanted: set[tuple[str, ...]] = set()
             for paper in papers:
                 if paper.id is None:
                     continue
                 row = row_index.get(paper.id)
                 if row is None:
                     continue
+                paths: list[tuple[str, ...]] = []
                 if assignments:
-                    names = [
-                        labels[idx].name for idx, _score in assignments[row]
-                        if 0 <= idx < len(labels)
-                    ]
-                    if names:
-                        matched_labels[paper.id] = names
-                        wanted_names |= set(names)
-                category_names = self._categoriser.categories_for_vector(matrix[row])
-                if category_names:
-                    matched_categories[paper.id] = category_names
-                    wanted_names |= set(category_names)
+                    hits = most_specific_labels(
+                        [idx for idx, _score in assignments[row]], labels
+                    )
+                    paths += [labels[idx].path for idx in hits]
+                paths += [(n,) for n in self._categoriser.categories_for_vector(matrix[row])]
+                if paths:
+                    matched_paths[paper.id] = paths
+                    wanted |= set(paths)
 
-            col_by_name = _resolve_collections(wanted_names, self._db) if wanted_names else {}
+            col_by_path = _resolve_collections(wanted, self._db) if wanted else {}
 
             for paper in papers:
                 col_ids = set(paper.collection_ids)
                 tags = set(paper.tags)
 
                 if paper.id is not None:
-                    for name in matched_labels.get(paper.id, []):
-                        if name in col_by_name:
-                            col_ids.add(col_by_name[name])
-                    for name in matched_categories.get(paper.id, []):
-                        if name in col_by_name:
-                            col_ids.add(col_by_name[name])
+                    for path in matched_paths.get(paper.id, []):
+                        if path in col_by_path:
+                            col_ids.add(col_by_path[path])
 
                 kw_text = paper.abstract or paper.title
                 if kw_text:
                     tags |= set(extract_keywords(kw_text, top=self._categoriser.tag_count))
 
+                new_taxa = paper.taxa if paper.taxa_locked else taxa.match(taxa_text(paper))
                 new_col_ids = sorted(col_ids)
                 new_tags = sorted(tags)
-                if new_col_ids != sorted(paper.collection_ids) or new_tags != sorted(paper.tags):
+                if (
+                    new_col_ids != sorted(paper.collection_ids)
+                    or new_tags != sorted(paper.tags)
+                    or new_taxa != paper.taxa
+                ):
                     paper.collection_ids = new_col_ids
                     paper.tags = new_tags
+                    paper.taxa = new_taxa
                     self._db.update_paper(paper)
                     updated += 1
 

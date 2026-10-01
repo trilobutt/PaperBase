@@ -13,6 +13,7 @@ import pytest
 
 import paperbase.core.categoriser as categoriser
 from paperbase.core.categoriser import CategorizationWorker, EmbeddingCategoriser, paper_text
+from paperbase.core.taxa import parse_taxa
 from paperbase.core.taxonomy import Label
 from paperbase.core.vectors import VectorStore
 from paperbase.models.collection import Collection
@@ -127,7 +128,7 @@ def test_categorise_paper_creates_collections(fake_model, db) -> None:
     paper = make_paper(title="Quantum Mechanics", abstract=ABSTRACT_TEXT)
     paper.id = db.insert_paper(paper)
 
-    col_ids, _tags = cat.categorise_paper(paper, db)
+    col_ids, _tags, _taxa = cat.categorise_paper(paper, db)
     assert col_ids, "expected at least one collection id"
 
     collections = db.get_collections()
@@ -142,7 +143,7 @@ def test_tags_without_model(db) -> None:
     paper = make_paper(title="Untagged Paper", abstract=ABSTRACT_TEXT)
     paper.id = db.insert_paper(paper)
 
-    col_ids, tags = cat.categorise_paper(paper, db)
+    col_ids, tags, _taxa = cat.categorise_paper(paper, db)
     assert col_ids == []
     assert tags, "expected keyword tags even without a model"
 
@@ -247,3 +248,84 @@ def test_worker_without_model_still_tags(monkeypatch, db, store_path) -> None:
         updated = db.get_paper(p.id)
         assert updated is not None
         assert updated.tags, "expected keyword tags even without a model"
+
+
+TAXA = parse_taxa(
+    "Arthropoda: arthropods\n"
+    "Arthropoda > Coleoptera: beetles\n"
+    "Arthropoda > Coleoptera > Histeridae: clown beetles\n"
+    "Arthropoda > Araneae: spiders\n"
+)
+
+
+def _no_model(monkeypatch) -> None:
+    def _raise_import_error(name):
+        raise ImportError("no model available")
+
+    monkeypatch.setattr(categoriser, "_load_sentence_transformer", _raise_import_error)
+
+
+def test_taxa_assigned_without_model(db) -> None:
+    cat = EmbeddingCategoriser()  # model never loaded
+    cat.update_settings(categories=[], threshold=0.3, tag_count=5, taxa=TAXA)
+    paper = make_paper(
+        title="Clown beetles (Coleoptera: Histeridae) of Borneo", abstract=ABSTRACT_TEXT
+    )
+    paper.id = db.insert_paper(paper)
+
+    col_ids, _tags, taxa = cat.categorise_paper(paper, db)
+    assert col_ids == []
+    assert taxa == ["Histeridae"]
+
+
+def test_hierarchical_labels_nest_and_keep_most_specific(fake_model, db) -> None:
+    cat = EmbeddingCategoriser()
+    labels = [Label(name="Palaeontology"), Label(name="Taphonomy", parents=("Palaeontology",))]
+    # threshold=-1.0 matches both labels; only the child may be stored.
+    cat.update_settings(categories=[], threshold=-1.0, tag_count=5, labels=labels)
+    cat.load_model()
+    paper = make_paper(title="Decay experiments", abstract=ABSTRACT_TEXT)
+    paper.id = db.insert_paper(paper)
+
+    col_ids, _tags, _taxa = cat.categorise_paper(paper, db)
+
+    by_id = {c.id: c for c in db.get_collections()}
+    assert len(col_ids) == 1
+    child = by_id[col_ids[0]]
+    assert child.name == "Taphonomy"
+    assert by_id[child.parent_id].name == "Palaeontology"
+    assert by_id[child.parent_id].parent_id is None
+
+
+def test_resolve_reuses_existing_parent(fake_model, db) -> None:
+    existing = db.insert_collection(Collection(id=None, name="Palaeontology", parent_id=None))
+    cat = EmbeddingCategoriser()
+    labels = [Label(name="Palaeontology"), Label(name="Taphonomy", parents=("Palaeontology",))]
+    cat.update_settings(categories=[], threshold=-1.0, tag_count=5, labels=labels)
+    cat.load_model()
+    paper = make_paper(title="Decay", abstract=ABSTRACT_TEXT)
+    paper.id = db.insert_paper(paper)
+
+    cat.categorise_paper(paper, db)
+
+    tops = [c for c in db.get_collections() if c.name == "Palaeontology"]
+    assert [c.id for c in tops] == [existing]
+
+
+def test_worker_replaces_taxa_unless_locked(monkeypatch, db, store_path) -> None:
+    _no_model(monkeypatch)
+    cat = EmbeddingCategoriser()
+    cat.update_settings(categories=[], threshold=0.3, tag_count=5, taxa=TAXA)
+    stale = make_paper(title="Spiders of Chile", abstract=ABSTRACT_TEXT, taxa=["Removed"])
+    locked = make_paper(
+        title="Spiders of Peru", abstract=ABSTRACT_TEXT, taxa=["Coleoptera"], taxa_locked=True
+    )
+    stale.id = db.insert_paper(stale)
+    locked.id = db.insert_paper(locked)
+    store = VectorStore(store_path)
+    store.open()
+
+    CategorizationWorker(db, cat, store).run()
+
+    assert db.get_paper(stale.id).taxa == ["Araneae"]
+    assert db.get_paper(locked.id).taxa == ["Coleoptera"]

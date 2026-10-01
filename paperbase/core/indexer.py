@@ -98,6 +98,15 @@ class Indexer:
         self._writer.delete_documents("paper_id", paper_id)
         self._writer.commit()
 
+    def delete_documents(self, paper_ids: list[int]) -> None:
+        """Delete many documents under one commit (a commit is an fsync and a segment)."""
+        self._ensure_open()
+        self._ensure_writer()
+        assert self._writer is not None
+        for paper_id in paper_ids:
+            self._writer.delete_documents("paper_id", paper_id)
+        self._writer.commit()
+
     def index_papers_bulk(
         self,
         papers: list[tuple[Paper, str]],   # (paper, fulltext)

@@ -7,10 +7,12 @@ from PyQt6.QtWidgets import (
 )
 
 from paperbase.core.db import Database
+from paperbase.core.taxa import TaxonTree
 from paperbase.models.collection import Collection
 
 COLLECTION_ID_ROLE = Qt.ItemDataRole.UserRole + 1
 TAG_ROLE           = Qt.ItemDataRole.UserRole + 2
+TAXON_ROLE         = Qt.ItemDataRole.UserRole + 3
 
 _PAPER_IDS_MIME = "application/x-paperbase-paper-ids"
 
@@ -65,12 +67,18 @@ class _CollectionTreeView(QTreeView):
 class CollectionTree(QWidget):
     collection_selected       = pyqtSignal(object)  # Optional[int] — collection_id or None
     tag_selected              = pyqtSignal(object)  # Optional[str] — tag name or None
+    taxon_selected            = pyqtSignal(object)  # Optional[list[str]] — taxon subtree or None
     papers_added_to_collection = pyqtSignal(list)   # list[int] of affected paper_ids
 
     def __init__(self, db: Database, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._db = db
+        self._taxa: TaxonTree = TaxonTree([])
         self._build_ui()
+
+    def set_taxa(self, taxa: TaxonTree) -> None:
+        """Use `taxa` for the Taxa branch from the next refresh() on."""
+        self._taxa = taxa
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -91,6 +99,10 @@ class CollectionTree(QWidget):
         # Populated by MainWindow.start_deferred_load, after the first paint.
 
     def refresh(self) -> None:
+        open_taxa = {
+            item.data(TAXON_ROLE) for item in self._taxon_items()
+            if self._tree.isExpanded(item.index())
+        }
         self._model.clear()
 
         # --- Collections ---
@@ -122,6 +134,19 @@ class CollectionTree(QWidget):
                 col_map[col.id] = item
             remaining = unresolved
 
+        # --- Taxa ---
+        # Absent without a taxa.txt, rather than a heading that can never hold anything.
+        taxa_root: Optional[QStandardItem] = None
+        if len(self._taxa):
+            taxa_root = QStandardItem("Taxa")
+            taxa_root.setEditable(False)
+            taxa_root.setData("", TAXON_ROLE)
+            font_taxa = taxa_root.font()
+            font_taxa.setBold(True)
+            taxa_root.setFont(font_taxa)
+            self._model.appendRow(taxa_root)
+            self._add_taxa(taxa_root)
+
         # --- Tags ---
         tag_root = QStandardItem("Tags")
         tag_root.setEditable(False)
@@ -137,11 +162,92 @@ class CollectionTree(QWidget):
             item.setData(tag, TAG_ROLE)
             tag_root.appendRow(item)
 
-        self._tree.expandAll()
+        # Collections and tags open as before. The taxon tree opens one level, so its roots
+        # are visible and the hundreds of taxa below them wait to be asked for, plus a row
+        # with no sibling to choose instead, plus whatever was open before this rebuild:
+        # every paper edit refreshes the tree, and a branch drilled into must not snap
+        # shut behind it.
+        self._tree.expandRecursively(col_root.index())
+        if taxa_root is not None:
+            self._tree.expand(taxa_root.index())
+            only = taxa_root
+            while only.rowCount() == 1:
+                only = only.child(0)
+                self._tree.expand(only.index())
+            for item in self._taxon_items():
+                if item.data(TAXON_ROLE) in open_taxa:
+                    self._tree.expand(item.index())
+        self._tree.expand(tag_root.index())
+
+    def _add_taxa(self, root: QStandardItem) -> None:
+        """Fill the Taxa branch with the taxa papers hold, and every taxon above them.
+
+        Only populated branches: the full tree runs to hundreds of taxa, most of them
+        empty in any one library. An unbranched run folds into one row named for its last
+        taxon, since a rank no paper stores that leads to a single populated child offers
+        nothing to choose, and taxa.txt nests Histeridae nineteen ranks deep, which
+        indents it past the panel's edge. The folded ranks are in the row's tooltip, and
+        the row filters to the same papers its first rank would.
+        """
+        stored = {name for name in self._db.get_taxon_counts() if name in self._taxa}
+        populated = set(stored)
+        for name in stored:
+            populated.update(self._taxa.ancestors(name))
+
+        def add(parent: QStandardItem, name: str) -> None:
+            chain = [name]
+            while chain[-1] not in stored:
+                below = [c for c in self._taxa.children(chain[-1]) if c in populated]
+                if len(below) != 1:
+                    break
+                chain.append(below[0])
+            last = chain[-1]
+            item = QStandardItem(last)
+            item.setEditable(False)
+            item.setData(last, TAXON_ROLE)
+            tips = [" > ".join(chain)] if len(chain) > 1 else []
+            taxon = self._taxa.get(last)
+            if taxon is not None and taxon.informal:
+                # Informal groupings are conveniences, not clades. Italic says so without
+                # a word of chrome on every row.
+                italic = item.font()
+                italic.setItalic(True)
+                item.setFont(italic)
+                tips.append(f"{last} is an informal, non-monophyletic grouping")
+            if tips:
+                item.setToolTip("\n".join(tips))
+            parent.appendRow(item)
+            for child in self._taxa.children(last):
+                if child in populated:
+                    add(item, child)
+
+        for name in self._taxa.children(None):
+            if name in populated:
+                add(root, name)
+
+    def _taxon_items(self) -> list[QStandardItem]:
+        """Every row under the Taxa heading, depth first; empty when there is none."""
+        top = self._model.invisibleRootItem()
+        stack = [
+            top.child(r) for r in range(top.rowCount()) if top.child(r).data(TAXON_ROLE) == ""
+        ]
+        out: list[QStandardItem] = []
+        while stack:
+            item = stack.pop()
+            for r in range(item.rowCount()):
+                out.append(item.child(r))
+                stack.append(item.child(r))
+        return out
 
     def _on_selection_changed(self, current: QModelIndex, previous: QModelIndex) -> None:
         item = self._model.itemFromIndex(current)
         if item is None:
+            return
+        taxon = item.data(TAXON_ROLE)
+        if isinstance(taxon, str) and taxon:
+            # A taxon filters to itself and everything below it: papers store only their
+            # most specific taxa, so the descendants are resolved here, from the tree.
+            self.taxon_selected.emit(self._taxa.descendants_and_self(taxon))
             return
         tag = item.data(TAG_ROLE)
         col_id = item.data(COLLECTION_ID_ROLE)
@@ -152,6 +258,7 @@ class CollectionTree(QWidget):
         else:
             self.collection_selected.emit(None)
             self.tag_selected.emit(None)
+            self.taxon_selected.emit(None)
 
     def _on_papers_dropped(self, paper_ids: list[int], collection_id: int) -> None:
         for pid in paper_ids:
@@ -163,6 +270,8 @@ class CollectionTree(QWidget):
         item = self._model.itemFromIndex(index)
         if item is None:
             return
+        if isinstance(item.data(TAXON_ROLE), str):
+            return  # the taxon tree mirrors taxa.txt and is edited there, not here
 
         col_id = item.data(COLLECTION_ID_ROLE)
         tag = item.data(TAG_ROLE)

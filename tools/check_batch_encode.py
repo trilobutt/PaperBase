@@ -82,7 +82,7 @@ def main() -> None:
 
     results = cat.categorise_papers(papers, db)
     assert len(results) == 64, f"expected 64 results, got {len(results)}"
-    for col_ids, tags in results:
+    for col_ids, tags, _taxa in results:
         assert tags, "expected every pair to carry non-empty tags"
 
     # Two single-text calls from _recompute_embeddings (one per category), then exactly

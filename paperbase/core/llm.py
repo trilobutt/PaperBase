@@ -18,7 +18,7 @@ class LLMCategoriser:
         target_collections: list[str],
         existing_tags: list[str],
     ) -> tuple[Optional[str], list[str]]:
-        col_ids, tags = self._categoriser.categorise_paper(paper, self._db)
+        col_ids, tags, _taxa = self._categoriser.categorise_paper(paper, self._db)
         col_name: Optional[str] = None
         if col_ids:
             col = self._db.get_collection(col_ids[0])

@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS papers (
     open_access     INTEGER NOT NULL DEFAULT 0,
     isbn            TEXT,
     document_type   TEXT NOT NULL DEFAULT 'article',
-    content_hash    TEXT
+    content_hash    TEXT,
+    taxa            TEXT NOT NULL DEFAULT '[]',
+    taxa_locked     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS collections (
@@ -61,7 +63,8 @@ def _now_iso() -> str:
 _SLIM_COLS = (
     "id, doi, title, authors, journal, year, volume, issue, pages, "
     "tags, collection_ids, file_path, date_added, date_modified, "
-    "metadata_source, needs_review, open_access, isbn, document_type, content_hash"
+    "metadata_source, needs_review, open_access, isbn, document_type, content_hash, "
+    "taxa, taxa_locked"
 )
 
 
@@ -90,6 +93,8 @@ def _paper_from_row(row: sqlite3.Row) -> Paper:
         isbn=row["isbn"] if "isbn" in keys else None,
         document_type=row["document_type"] if "document_type" in keys else "article",
         content_hash=row["content_hash"] if "content_hash" in keys else None,
+        taxa=json.loads(row["taxa"]) if "taxa" in keys else [],
+        taxa_locked=bool(row["taxa_locked"]) if "taxa_locked" in keys else False,
     )
 
 
@@ -118,6 +123,8 @@ def _paper_slim_from_row(row: sqlite3.Row) -> Paper:
         isbn=row["isbn"] if "isbn" in keys else None,
         document_type=row["document_type"] if "document_type" in keys else "article",
         content_hash=row["content_hash"] if "content_hash" in keys else None,
+        taxa=json.loads(row["taxa"]) if "taxa" in keys else [],
+        taxa_locked=bool(row["taxa_locked"]) if "taxa_locked" in keys else False,
     )
 
 
@@ -152,6 +159,8 @@ class Database:
             "ALTER TABLE papers ADD COLUMN isbn TEXT",
             "ALTER TABLE papers ADD COLUMN document_type TEXT NOT NULL DEFAULT 'article'",
             "ALTER TABLE papers ADD COLUMN content_hash TEXT",
+            "ALTER TABLE papers ADD COLUMN taxa TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE papers ADD COLUMN taxa_locked INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 self._conn.execute(stmt)
@@ -188,8 +197,8 @@ class Database:
                 (doi, title, authors, journal, year, volume, issue, pages,
                  abstract, keywords, tags, collection_ids, file_path,
                  date_added, date_modified, metadata_source, needs_review, open_access,
-                 isbn, document_type, content_hash)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 isbn, document_type, content_hash, taxa, taxa_locked)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 paper.doi,
@@ -213,6 +222,8 @@ class Database:
                 paper.isbn,
                 paper.document_type,
                 paper.content_hash,
+                json.dumps(paper.taxa),
+                int(paper.taxa_locked),
             ),
         )
         conn.commit()
@@ -227,7 +238,7 @@ class Database:
                 pages=?, abstract=?, keywords=?, tags=?, collection_ids=?,
                 file_path=?, date_modified=?, metadata_source=?,
                 needs_review=?, open_access=?, isbn=?, document_type=?,
-                content_hash=?
+                content_hash=?, taxa=?, taxa_locked=?
             WHERE id=?
             """,
             (
@@ -251,6 +262,8 @@ class Database:
                 paper.isbn,
                 paper.document_type,
                 paper.content_hash,
+                json.dumps(paper.taxa),
+                int(paper.taxa_locked),
                 paper.id,
             ),
         )
@@ -262,7 +275,7 @@ class Database:
             "doi", "title", "authors", "journal", "year", "volume", "issue",
             "pages", "abstract", "keywords", "tags", "collection_ids",
             "file_path", "metadata_source", "needs_review", "open_access",
-            "isbn", "document_type", "content_hash",
+            "isbn", "document_type", "content_hash", "taxa", "taxa_locked",
         }
         if field not in allowed:
             raise ValueError(f"Unknown field: {field}")
@@ -395,6 +408,19 @@ class Database:
         ).fetchall()
         return [r["tag"] for r in rows]
 
+    def get_taxon_counts(self) -> dict[str, int]:
+        """Papers per stored taxon name.
+
+        Stored names are each paper's most specific taxa; the sidebar resolves ancestors
+        from the taxon tree. json_each keeps the scan inside SQLite, as in get_all_tags.
+        """
+        conn = self._conn_required()
+        rows = conn.execute(
+            "SELECT t.value AS taxon, COUNT(*) AS n FROM papers p, json_each(p.taxa) t "
+            "WHERE p.taxa != '[]' GROUP BY t.value"
+        ).fetchall()
+        return {r["taxon"]: r["n"] for r in rows}
+
     def get_all_paper_ids(self) -> list[int]:
         conn = self._conn_required()
         rows = conn.execute("SELECT id FROM papers ORDER BY id").fetchall()
@@ -412,6 +438,7 @@ class Database:
         year_to: Optional[int] = None,
         journal: Optional[str] = None,
         tags: Optional[list[str]] = None,
+        taxa: Optional[list[str]] = None,
         collection_id: Optional[int] = None,
         needs_review_only: bool = False,
         document_type: Optional[str] = None,
@@ -466,6 +493,14 @@ class Database:
                 f"EXISTS (SELECT 1 FROM json_each(p.tags) jt WHERE jt.value IN ({placeholders}))"
             )
             params.extend(tags)
+        if taxa:
+            # One JSON parameter rather than a placeholder per name: a taxon's descendant
+            # list runs to hundreds of names, against the 999-variable ceiling.
+            conditions.append(
+                "EXISTS (SELECT 1 FROM json_each(p.taxa) jx "
+                "WHERE jx.value IN (SELECT value FROM json_each(?)))"
+            )
+            params.append(json.dumps(taxa))
         if collection_id is not None:
             col_ids = sorted(self._ancestor_and_self(collection_id))
             placeholders = ",".join("?" * len(col_ids))

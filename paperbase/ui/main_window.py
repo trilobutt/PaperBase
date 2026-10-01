@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 from paperbase.core.categoriser import EmbeddingCategoriser
 from paperbase.core.db import Database
 from paperbase.core.indexer import Indexer
+from paperbase.core.taxa import TaxonTree, load_taxa
 from paperbase.core.taxonomy import TaxonomyError, load_taxonomy
 from paperbase.core.vectors import VectorStore
 from paperbase.models.paper import Paper
@@ -48,6 +49,7 @@ class MainWindow(QMainWindow):
         self._cat_dialog: Optional[CategorizationDialog] = None
         self._backfill_dialog: Optional[BackfillDialog] = None
 
+        self._taxa: TaxonTree = TaxonTree([])
         self._categoriser = EmbeddingCategoriser()
         self._apply_categoriser_settings()
         self.setWindowTitle("PaperBase")
@@ -71,22 +73,28 @@ class MainWindow(QMainWindow):
         self._refresh_status()
 
     def _preload_categoriser(self) -> None:
-        if self._settings.auto_categorise and self._categoriser.has_categories:
+        if self._settings.auto_categorise and self._categoriser.has_embedding_targets:
             threading.Thread(target=self._categoriser.load_model, daemon=True).start()
 
     def _apply_categoriser_settings(self) -> None:
-        """Push settings plus the taxonomy file onto the categoriser. One place, two callers."""
+        """Push settings plus the taxonomy and taxa files onto the categoriser. One place,
+        two callers."""
         try:
             labels = load_taxonomy(self._settings.taxonomy_file())
         except TaxonomyError as e:
             logger.warning("Taxonomy could not be read: %s", e)
             labels = []
+        try:
+            self._taxa = load_taxa(self._settings.taxa_file())
+        except TaxonomyError as e:
+            logger.warning("Taxon tree could not be read: %s", e)
+            self._taxa = TaxonTree([])
         self._categoriser.update_settings(
             categories=self._settings.categories,
             threshold=self._settings.category_threshold,
             tag_count=self._settings.tag_count,
             labels=labels,
-            top_k=self._settings.taxonomy_top_k,
+            taxa=self._taxa,
         )
 
     def _build_ui(self) -> None:
@@ -153,6 +161,8 @@ class MainWindow(QMainWindow):
         self._collection_tree.collection_selected.connect(self._on_collection_selected)
         self._collection_tree.tag_selected.connect(self._on_tag_selected)
         self._collection_tree.papers_added_to_collection.connect(self._on_papers_added_to_collection)
+        self._collection_tree.taxon_selected.connect(self._on_taxon_selected)
+        self._collection_tree.set_taxa(self._taxa)
         library_panel = GlassPanel("Library", accent=theme.ACCENT_LIME)
         library_panel.set_content(self._collection_tree)
         splitter.addWidget(library_panel)
@@ -173,6 +183,7 @@ class MainWindow(QMainWindow):
         self._detail_panel = PaperDetail(self._db, user_email=self._settings.user_email)
         self._detail_panel.paper_changed.connect(self._on_paper_changed)
         self._detail_panel.setMinimumWidth(260)
+        self._detail_panel.set_taxa(self._taxa)
         paper_panel = GlassPanel("Paper", accent=theme.ACCENT_MAGENTA)
         paper_panel.set_content(self._detail_panel)
         splitter.addWidget(paper_panel)
@@ -215,6 +226,9 @@ class MainWindow(QMainWindow):
 
     def _on_tag_selected(self, tag: Optional[str]) -> None:
         self._search_panel.set_tag_filter(tag)
+
+    def _on_taxon_selected(self, taxa: Optional[list[str]]) -> None:
+        self._search_panel.set_taxa_filter(taxa)
 
     def _on_paper_changed(self, paper_id: int) -> None:
         self._search_panel.reload_current_paper(paper_id)
@@ -289,6 +303,9 @@ class MainWindow(QMainWindow):
             self._settings.save(self._settings_path)
             self._detail_panel.set_user_email(self._settings.user_email)
             self._apply_categoriser_settings()
+            self._collection_tree.set_taxa(self._taxa)
+            self._collection_tree.refresh()
+            self._detail_panel.set_taxa(self._taxa)
             # If categories were just configured for the first time, preload the model.
             self._preload_categoriser()
             # ImportDialog is cached; invalidate it so it picks up the new categoriser state.
@@ -306,7 +323,7 @@ class MainWindow(QMainWindow):
         shut for it would make the library unusable for the duration.
         """
         if self._backfill_dialog is None:
-            self._backfill_dialog = BackfillDialog(db=self._db, parent=self)
+            self._backfill_dialog = BackfillDialog(db=self._db, indexer=self._indexer, parent=self)
             self._backfill_dialog.finished.connect(self._on_backfill_finished)
         self._backfill_dialog.show()
         self._backfill_dialog.raise_()

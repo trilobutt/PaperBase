@@ -179,13 +179,15 @@ class ImportWorker(QThread):
 
     def _apply_categorisation_batch(self, papers: list[Paper]) -> None:
         """Merge auto-categorisation onto a batch, and store each paper's vector. No-op if no
-        categoriser is configured or its model never loaded.
+        categoriser is configured.
 
-        categorise_papers does the encoding (it already batches it) and, given vector_store,
-        persists each vector in the same pass, so re-running categorisation over the library
-        never re-embeds.
+        Without a loaded model categorise_papers still returns keyword tags and taxa, which
+        need none, so those land at import; collections wait for a categorisation run.
+        With the model, categorise_papers does the encoding (it already batches it) and,
+        given vector_store, persists each vector in the same pass, so re-running
+        categorisation over the library never re-embeds.
         """
-        if self._categoriser is None or not self._categoriser.is_loaded:
+        if self._categoriser is None:
             return
         try:
             results = self._categoriser.categorise_papers(
@@ -194,12 +196,18 @@ class ImportWorker(QThread):
         except Exception as e:
             logger.warning("Auto-categorisation failed for a batch of %d: %s", len(papers), e)
             return
-        for paper, (col_ids, tags) in zip(papers, results):
+        for paper, (col_ids, tags, taxa) in zip(papers, results):
             new_col_ids = sorted(set(paper.collection_ids) | set(col_ids))
             new_tags = sorted(set(paper.tags) | set(tags))
-            if new_col_ids != paper.collection_ids or new_tags != paper.tags:
+            new_taxa = paper.taxa if paper.taxa_locked else taxa
+            if (
+                new_col_ids != paper.collection_ids
+                or new_tags != paper.tags
+                or new_taxa != paper.taxa
+            ):
                 paper.collection_ids = new_col_ids
                 paper.tags = new_tags
+                paper.taxa = new_taxa
                 try:
                     self._db.update_paper(paper)
                 except Exception as e:

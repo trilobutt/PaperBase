@@ -26,3 +26,5 @@ class Paper:
     isbn: Optional[str] = None          # ISBN-13 preferred; populated for books
     document_type: str = 'article'      # "article" | "book" | "book-chapter" | "proceedings"
     content_hash: Optional[str] = None  # SHA-256 of the PDF bytes; None on pre-hash rows
+    taxa: list[str] = field(default_factory=list)  # most specific taxon names, from taxa.txt
+    taxa_locked: bool = False           # set by a hand edit; categorisation then leaves taxa alone

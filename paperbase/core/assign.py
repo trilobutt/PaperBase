@@ -25,32 +25,31 @@ def normalise(vectors: np.ndarray) -> np.ndarray:
     return (vectors / safe_norms).astype(np.float32)
 
 
-def top_labels(
+def labels_above(
     doc_vecs: np.ndarray,
     label_vecs: np.ndarray,
     threshold: float,
-    top_k: int,
     chunk: int = 4096,
 ) -> list[list[tuple[int, float]]]:
-    """Match each document row to its best-scoring label rows.
+    """Match each document row to every label row scoring at or above `threshold`.
 
-    Both `doc_vecs` and `label_vecs` are assumed already unit-normalised, so the score
-    between a document and a label is a plain dot product.
+    There is no per-document cap: the threshold is the only control on how many labels a
+    document gets. Both `doc_vecs` and `label_vecs` are assumed already unit-normalised, so
+    the score between a document and a label is a plain dot product.
 
     Args:
         doc_vecs: array of shape `(n_docs, dim)`.
         label_vecs: array of shape `(n_labels, dim)`.
         threshold: minimum score for a label to be included.
-        top_k: maximum number of labels returned per document.
         chunk: documents processed per batch, so peak memory is `chunk * n_labels` floats
             rather than `n_docs * n_labels`. The result does not depend on this value.
 
     Returns:
-        One list per document row, each holding at most `top_k` `(label_index, score)`
-        pairs with `score >= threshold`, sorted by descending score then ascending label
-        index. A document row with zero norm returns an empty list regardless of
-        `threshold`. `doc_vecs` with 0 rows returns `[]`; `label_vecs` with 0 rows returns
-        one empty list per document.
+        One list per document row of `(label_index, score)` pairs with
+        `score >= threshold`, sorted by descending score then ascending label index. A
+        document row with zero norm returns an empty list regardless of `threshold`.
+        `doc_vecs` with 0 rows returns `[]`; `label_vecs` with 0 rows returns one empty
+        list per document.
     """
     n_docs = doc_vecs.shape[0]
     n_labels = label_vecs.shape[0]
@@ -60,22 +59,14 @@ def top_labels(
     if n_labels == 0:
         return [[] for _ in range(n_docs)]
 
-    k = max(0, min(top_k, n_labels))
-    if k == 0:
-        return [[] for _ in range(n_docs)]
-
     # Selection stays in numpy. A Python loop over every (document, label) score took
-    # 12 s for 150,000 papers against 300 labels, and a full per-row sort 4 s, where the
-    # matmul itself takes a fraction of a second.
+    # 12 s for 150,000 papers against 300 labels, where the matmul itself takes a fraction
+    # of a second.
     results: list[list[tuple[int, float]]] = []
     for start in range(0, n_docs, chunk):
         block = doc_vecs[start : start + chunk]
         scores = block @ label_vecs.T
-        # Each row's k-th best score, found by partition rather than a sort. Everything
-        # at or above it (and above threshold) survives; ties at the cut can let more
-        # than k through, and the lexsort below settles those by ascending label index.
-        kth = np.partition(scores, n_labels - k, axis=1)[:, n_labels - k]
-        keep = scores >= np.maximum(kth, threshold)[:, None]
+        keep = scores >= threshold
         keep[~np.any(block, axis=1)] = False
         rows, cols = np.nonzero(keep)
         vals = scores[rows, cols]
@@ -85,8 +76,7 @@ def top_labels(
         vals_l = vals[order].tolist()
         pos = 0
         for n in counts:
-            take = min(n, k)
-            results.append(list(zip(cols_l[pos : pos + take], vals_l[pos : pos + take])))
+            results.append(list(zip(cols_l[pos : pos + n], vals_l[pos : pos + n])))
             pos += n
 
     return results

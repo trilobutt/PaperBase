@@ -14,20 +14,23 @@ Two islands on the canvas and a chrome control strip:
   groups it found, each row carrying the full path because the path is what tells the user
   which copy to keep.
 
-Nothing here deletes, merges or edits a paper, and the report says so on its face.
+Nothing is deleted without the user pressing Remove duplicates and confirming it. The
+button keeps one copy per group (see ``core.dedupe.choose_keeper``) and says so.
 """
 
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+    QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
 from paperbase.core.backfill import HashBackfillWorker
 from paperbase.core.db import Database
+from paperbase.core.dedupe import DedupeWorker
+from paperbase.core.indexer import Indexer
 from paperbase.models.paper import Paper
 from paperbase.ui import theme
 from paperbase.ui.glass import (
@@ -63,12 +66,17 @@ class BackfillDialog(QDialog):
     _PAGE_UNSCANNED = 0
     _PAGE_RESULT = 1
 
-    def __init__(self, db: Database, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self, db: Database, indexer: Indexer, parent: Optional[QWidget] = None
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Fingerprint Library")
         self.setMinimumSize(720, 700)
         self._db = db
+        self._indexer = indexer
         self._worker: Optional[HashBackfillWorker] = None
+        self._dedupe_worker: Optional[DedupeWorker] = None
+        self._groups: list[tuple[str, list[int]]] = []
         self._stop_requested = False
         self._build_ui()
 
@@ -170,12 +178,20 @@ class BackfillDialog(QDialog):
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop)
 
+        # Keeps one copy per group and deletes the rest from library and disk, so it is
+        # red and stays disabled until a scan has actually found something.
+        self._dedupe_btn = QPushButton("Remove duplicates")
+        self._dedupe_btn.setObjectName("danger")
+        self._dedupe_btn.setEnabled(False)
+        self._dedupe_btn.clicked.connect(self._remove_duplicates)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
 
         row.addWidget(self._start_btn)
         row.addWidget(self._stop_btn)
         row.addStretch()
+        row.addWidget(self._dedupe_btn)
         row.addWidget(close_btn)
         bar.content_layout.addLayout(row)
         return bar
@@ -183,6 +199,35 @@ class BackfillDialog(QDialog):
     # ------------------------------------------------------------------
     # The run
     # ------------------------------------------------------------------
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        self._load_existing_report()
+
+    def _load_existing_report(self) -> None:
+        """Show the duplicates already in the database. Fingerprints persist across runs, so
+        the report must not depend on a scan having finished in this dialog's lifetime. The
+        dialog is cached by MainWindow, so this re-reads on every show, but never while a
+        scan or removal is running."""
+        busy = (self._worker is not None and self._worker.isRunning()) or (
+            self._dedupe_worker is not None and self._dedupe_worker.isRunning()
+        )
+        if busy:
+            return
+        covered, total = self._db.get_hash_coverage()
+        if not covered:
+            return
+        groups = self._db.get_duplicate_hash_groups()
+        self._groups = groups
+        self._dedupe_btn.setEnabled(bool(groups))
+        self._progress_bar.setValue(int(covered / total * 100))
+        status = f"{covered:,} of {total:,} papers already fingerprinted."
+        if groups:
+            status += f" {_plural(len(groups), 'group', 'groups')} of identical files, listed below."
+        elif covered == total:
+            status += " No two of them hold the same file."
+        self._status_label.setText(status)
+        self._show_result(groups, covered)
 
     def _start(self) -> None:
         self._stop_requested = False
@@ -222,6 +267,8 @@ class BackfillDialog(QDialog):
         self._bar_glow.setEnabled(False)
 
         groups = self._db.get_duplicate_hash_groups()
+        self._groups = groups
+        self._dedupe_btn.setEnabled(bool(groups))
         covered, total = self._db.get_hash_coverage()
         # The bar settles on what the library actually carries, which is the same number
         # the status line states. Filling it to 100% on a run where every file was
@@ -255,6 +302,61 @@ class BackfillDialog(QDialog):
         if unreadable:
             parts.append(f"{_plural(unreadable, 'file', 'files')} could not be read.")
         return " ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Removing duplicates
+    # ------------------------------------------------------------------
+
+    def _remove_duplicates(self) -> None:
+        extra = sum(len(ids) - 1 for _digest, ids in self._groups)
+        reply = QMessageBox.warning(
+            self,
+            "Remove duplicates",
+            f"Keep one copy in each of {_plural(len(self._groups), 'group', 'groups')} and "
+            f"permanently delete the other {extra:,} from the library and from disk?\n\n"
+            "Tags and collections of the removed copies are merged onto the one kept. "
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._dedupe_btn.setEnabled(False)
+        self._start_btn.setEnabled(False)
+        self._bar_glow.setEnabled(True)
+        self._progress_bar.setValue(0)
+        self._status_label.setText("Removing duplicates…")
+        self._dedupe_worker = DedupeWorker(self._db, self._indexer, self._groups, parent=self)
+        self._dedupe_worker.progress.connect(self._on_dedupe_progress)
+        self._dedupe_worker.finished_all.connect(self._on_dedupe_finished)
+        self._dedupe_worker.start()
+
+    @pyqtSlot(int, int)
+    def _on_dedupe_progress(self, done: int, total: int) -> None:
+        self._progress_bar.setValue(int(done / total * 100) if total else 0)
+        self._status_label.setText(f"Removed duplicates in {done:,} of {total:,} groups")
+
+    @pyqtSlot(int, int, int)
+    def _on_dedupe_finished(self, removed: int, deleted: int, skipped: int) -> None:
+        self._start_btn.setEnabled(True)
+        self._bar_glow.setEnabled(False)
+        text = f"Done. {_plural(removed, 'duplicate', 'duplicates')} removed from the library"
+        if deleted != removed:
+            text += f", {removed - deleted:,} of them with the file left on disk"
+        text += "."
+        if skipped:
+            text += (
+                f" {_plural(skipped, 'copy', 'copies')} left alone because the file no "
+                "longer matched its fingerprint."
+            )
+        groups = self._db.get_duplicate_hash_groups()
+        self._groups = groups
+        self._dedupe_btn.setEnabled(bool(groups))
+        covered, _total = self._db.get_hash_coverage()
+        self._progress_bar.setValue(100)
+        self._status_label.setText(text)
+        self._show_result(groups, covered)
 
     # ------------------------------------------------------------------
     # The report
@@ -306,9 +408,10 @@ class BackfillDialog(QDialog):
         layout.setSpacing(theme.SPACE)
 
         caption = QLabel(
-            "Nothing here is deleted, merged or edited. Each group lists every copy "
-            "found, with its full path, so you can keep the one you want and remove the "
-            "rest yourself."
+            "Each group lists every copy found, with its full path. Remove duplicates "
+            "keeps one copy per group (reviewed metadata first, then the most reliable "
+            "source, then a filed copy over one in Unsorted, then the oldest) and deletes "
+            "the rest from the library and from disk."
         )
         caption.setObjectName("FieldNote")
         caption.setWordWrap(True)

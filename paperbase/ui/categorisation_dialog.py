@@ -156,8 +156,8 @@ class CategorizationDialog(QDialog):
         hours-long one, and the user deserves that figure before committing to it."""
         if not self._categoriser.has_categories:
             return (
-                "Nothing to assign yet. Choose a taxonomy file or add categories in "
-                "Settings, then press Start."
+                "Nothing to assign yet. Add a taxonomy file, a "
+                "taxa.txt beside it, or categories in Settings, then press Start."
             )
         paper_ids = self._db.get_all_paper_ids()
         if not paper_ids:
@@ -166,19 +166,19 @@ class CategorizationDialog(QDialog):
         if pending == 0:
             return (
                 "Every paper already has a stored vector, so a run skips stage 1 and goes "
-                "straight to assigning collections and tags."
+                "straight to assigning collections, taxa, and tags."
             )
         return (
             f"Two stages: embedding the {pending:,} papers without a stored vector takes "
             f"{_duration(pending / _EMBED_PAPERS_PER_SECOND)} and is kept for later runs, "
-            "then assigning collections and tags takes a fraction of that."
+            "then assigning collections, taxa, and tags takes a fraction of that."
         )
 
     def _start(self) -> None:
         if not self._categoriser.has_categories:
             self._status_label.setText(self._idle_text())
             self._log.appendPlainText(
-                "No taxonomy labels or categories configured. Add them in Settings first."
+                "No taxonomy labels, taxa, or categories configured. Add them in Settings first."
             )
             return
 
@@ -285,11 +285,11 @@ class CategorizationDialog(QDialog):
             text = "Loading the embedding model…"
         elif self._keywords_only and self._stage == "embedding":
             text = (
-                "No embedding model, so stage 1 is skipped. This run adds keywords only "
-                "and assigns no collections."
+                "No embedding model, so stage 1 is skipped. This run adds keywords and taxa "
+                "only, and assigns no collections."
             )
         elif self._keywords_only:
-            text = f"Keywords only, no collections (no embedding model){counts}"
+            text = f"Keywords and taxa only, no collections (no embedding model){counts}"
         elif self._stage == "embedding":
             if not self._total:
                 text = f"Stage 1 of 2{_SEP}Embedding{_SEP}finding papers without a vector…"
@@ -301,7 +301,7 @@ class CategorizationDialog(QDialog):
                         else f"{_SEP}estimating time left…"
                     )
         else:
-            text = f"Stage 2 of 2{_SEP}Assigning collections and tags{counts or '…'}"
+            text = f"Stage 2 of 2{_SEP}Assigning collections, taxa, and tags{counts or '…'}"
 
         if self._paused:
             text = f"Paused{_SEP}{text}"

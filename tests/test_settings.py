@@ -1,4 +1,4 @@
-"""Tests for `Settings`: taxonomy path/top-k round-trip and `taxonomy_file()` resolution."""
+"""Tests for `Settings`: taxonomy path round-trip, `taxonomy_file()` and `taxa_file()`."""
 
 import json
 from pathlib import Path
@@ -9,14 +9,12 @@ from paperbase.ui.settings_dialog import Settings
 def test_taxonomy_fields_round_trip(tmp_path: Path) -> None:
     settings = Settings()
     settings.taxonomy_path = "C:/custom/taxonomy.txt"
-    settings.taxonomy_top_k = 7
 
     path = tmp_path / "settings.json"
     settings.save(path)
     loaded = Settings.load(path)
 
     assert loaded.taxonomy_path == "C:/custom/taxonomy.txt"
-    assert loaded.taxonomy_top_k == 7
 
 
 def test_taxonomy_file_explicit_path_wins(tmp_path: Path) -> None:
@@ -55,4 +53,15 @@ def test_load_without_taxonomy_key_uses_defaults(tmp_path: Path) -> None:
     loaded = Settings.load(path)
 
     assert loaded.taxonomy_path == ""
-    assert loaded.taxonomy_top_k == 4
+
+
+def test_taxa_file_sits_beside_taxonomy_file() -> None:
+    explicit = Settings()
+    explicit.taxonomy_path = "C:/custom/topics.txt"
+    assert explicit.taxa_file() == Path("C:/custom/taxa.txt")
+
+    fallback = Settings()
+    fallback.library_root = "C:/library"
+    assert fallback.taxa_file() == Path("C:/library") / "taxa.txt"
+
+    assert Settings().taxa_file() is None

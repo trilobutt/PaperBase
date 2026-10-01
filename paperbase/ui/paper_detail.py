@@ -6,15 +6,16 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QMimeData, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QMimeData, QPoint, QRect, QSize, QStringListModel, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QFocusEvent
 from PyQt6.QtWidgets import (
-    QApplication, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QStackedWidget, QVBoxLayout,
-    QWidget,
+    QApplication, QCompleter, QFormLayout, QFrame, QHBoxLayout, QLabel, QLayout, QLayoutItem,
+    QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 from paperbase.core.db import Database
+from paperbase.core.taxa import TaxonTree
 from paperbase.models.paper import Paper
 from paperbase.ui import theme
 from paperbase.ui.glass import EmptyState, panel_shadow
@@ -45,6 +46,69 @@ class TagChip(QPushButton):
         self.clicked.connect(lambda: self.removed.emit(self._tag))
 
 
+class _ChipFlow(QLayout):
+    """Chips left to right, wrapping to a new row when the next would pass the edge.
+
+    Qt ships no flow layout. A single QHBoxLayout row squeezed four taxon chips at the
+    panel's default width until each clipped its own name to a fragment. A chip wider
+    than the whole row is clipped instead of widening the form.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> Optional[QLayoutItem]:
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int) -> Optional[QLayoutItem]:
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientation:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._arrange(QRect(0, 0, width, 0), move=False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._arrange(rect, move=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize(0, 0)
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _arrange(self, rect: QRect, *, move: bool) -> int:
+        """Place every chip within `rect` (when `move`) and return the height they need."""
+        gap = self.spacing()
+        x, y, row_height = rect.x(), rect.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            width = min(hint.width(), rect.width())
+            if x > rect.x() and x + width > rect.x() + rect.width():
+                x, y, row_height = rect.x(), y + row_height + gap, 0
+            if move:
+                item.setGeometry(QRect(QPoint(x, y), QSize(width, hint.height())))
+            x += width + gap
+            row_height = max(row_height, hint.height())
+        return y + row_height - rect.y()
+
+
 class PaperDetail(QWidget):
     paper_changed = pyqtSignal(int)   # paper_id changed — tells results list to re-fetch
 
@@ -53,6 +117,7 @@ class PaperDetail(QWidget):
         self._db = db
         self._user_email = user_email
         self._paper: Optional[Paper] = None
+        self._taxa: TaxonTree = TaxonTree([])
         self._build_ui()
 
     def set_user_email(self, email: str) -> None:
@@ -200,16 +265,12 @@ class PaperDetail(QWidget):
 
         self._add_group_label(column, "Tags")
         self._tags_container = QWidget()
-        self._tags_flow = QHBoxLayout(self._tags_container)
-        self._tags_flow.setContentsMargins(0, 0, 0, 0)
+        self._tags_flow = _ChipFlow(self._tags_container)
         self._tags_flow.setSpacing(theme.SPACE // 2)
-        self._tags_flow.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        # A single row of chips is as wide as the tags happen to be (Qt has no flow
-        # layout, per CLAUDE.md), and without a floor of its own that width becomes the
-        # whole form's minimum: three ordinary tags then push every field in the panel
-        # past the viewport, where the disabled horizontal scrollbar silently clips them.
-        # The chips give first instead, which costs the tail of one row rather than the
-        # right-hand edge of every field above it.
+        # The chips wrap, but without a floor of its own the widest chip becomes the whole
+        # form's minimum width, and one long tag then pushes every field in the panel past
+        # the viewport, where the disabled horizontal scrollbar silently clips them. The
+        # chip gives first instead.
         self._tags_container.setMinimumWidth(1)
         column.addWidget(self._tags_container)
         column.addSpacing(theme.SPACE)
@@ -219,13 +280,66 @@ class PaperDetail(QWidget):
         self._tag_input = QLineEdit()
         self._tag_input.setPlaceholderText("Add tag…")
         self._tag_input.returnPressed.connect(self._add_tag)
+        # No fixed width, as with the Lookup buttons: the theme's 16px side padding left
+        # a 34px box no room for its own glyph.
         add_tag_btn = QPushButton("+")
-        add_tag_btn.setFixedWidth(34)
         add_tag_btn.setToolTip("Add this tag to the paper")
         add_tag_btn.clicked.connect(self._add_tag)
         add_tag_row.addWidget(self._tag_input)
         add_tag_row.addWidget(add_tag_btn)
         column.addLayout(add_tag_row)
+
+        self._add_group_label(column, "Taxa")
+        self._taxa_container = QWidget()
+        self._taxa_flow = _ChipFlow(self._taxa_container)
+        self._taxa_flow.setSpacing(theme.SPACE // 2)
+        # The same floor as the tag chips, for the same reason: see the note above it.
+        self._taxa_container.setMinimumWidth(1)
+        column.addWidget(self._taxa_container)
+        column.addSpacing(theme.SPACE)
+
+        # Shown only once the taxa are hand-edited: categorisation then leaves them alone,
+        # and this is the one place to hand them back.
+        self._taxa_lock_row = QWidget()
+        lock_hl = QHBoxLayout(self._taxa_lock_row)
+        lock_hl.setContentsMargins(0, 0, 0, 0)
+        lock_hl.setSpacing(theme.SPACE)
+        lock_note = QLabel("Edited by hand, so categorisation leaves these alone.")
+        lock_note.setObjectName("FieldNote")
+        lock_note.setWordWrap(True)
+        unlock_btn = QPushButton("Unlock")
+        unlock_btn.setToolTip("Let the next categorisation run recompute these taxa")
+        unlock_btn.clicked.connect(self._unlock_taxa)
+        lock_hl.addWidget(lock_note, 1)
+        lock_hl.addWidget(unlock_btn)
+        self._taxa_lock_row.hide()
+        column.addWidget(self._taxa_lock_row)
+        column.addSpacing(theme.SPACE)
+
+        add_taxon_row = QHBoxLayout()
+        add_taxon_row.setSpacing(theme.SPACE)
+        self._taxon_input = QLineEdit()
+        self._taxon_input.setPlaceholderText("Add taxon…")
+        self._taxon_input.setToolTip("Any name from taxa.txt")
+        self._taxon_completer = QCompleter([], self._taxon_input)
+        self._taxon_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._taxon_input.setCompleter(self._taxon_completer)
+        self._taxon_input.returnPressed.connect(self._add_taxon)
+        self._taxon_input.textEdited.connect(lambda _text: self._set_taxon_invalid(False))
+        add_taxon_btn = QPushButton("+")
+        add_taxon_btn.setToolTip("Add this taxon to the paper")
+        add_taxon_btn.clicked.connect(self._add_taxon)
+        add_taxon_row.addWidget(self._taxon_input)
+        add_taxon_row.addWidget(add_taxon_btn)
+        column.addLayout(add_taxon_row)
+        # A refused entry says why beside the red border, since colour alone names no
+        # cause and the tooltip is the last place anyone looks.
+        self._taxon_error = QLabel()
+        self._taxon_error.setObjectName("FieldError")
+        self._taxon_error.setWordWrap(True)
+        self._taxon_error.hide()
+        column.addSpacing(theme.SPACE // 2)
+        column.addWidget(self._taxon_error)
         column.addStretch(1)
 
         # ---- Pinned actions: outside the scroll area, so they never scroll away ----
@@ -270,7 +384,7 @@ class PaperDetail(QWidget):
         for field in (self._title_edit, self._authors_edit, self._journal_edit,
                       self._year_spin, self._doi_edit, self._isbn_edit,
                       self._volume_edit, self._issue_edit, self._pages_edit,
-                      self._tag_input):
+                      self._tag_input, self._taxon_input):
             field.setMinimumWidth(_FIELD_MIN)
 
         # The fields a needs-review flag actually implicates. Marking every field would
@@ -328,7 +442,7 @@ class PaperDetail(QWidget):
                   self._year_spin, self._doi_edit, self._doi_lookup_btn,
                   self._isbn_edit, self._isbn_lookup_btn,
                   self._volume_edit, self._issue_edit, self._pages_edit,
-                  self._abstract_edit, self._tag_input, self._open_btn,
+                  self._abstract_edit, self._tag_input, self._taxon_input, self._open_btn,
                   self._copy_pdf_btn, self._copy_text_btn, self._open_folder_btn):
             w.setEnabled(enabled)
 
@@ -361,6 +475,9 @@ class PaperDetail(QWidget):
         self._set_review_marks(paper.needs_review)
 
         self._refresh_tags()
+        self._taxon_input.clear()
+        self._set_taxon_invalid(False)
+        self._refresh_taxa()
 
     def clear(self) -> None:
         self._paper = None
@@ -379,6 +496,7 @@ class PaperDetail(QWidget):
         self._review_row.hide()
         self._set_review_marks(False)
         self._refresh_tags()
+        self._refresh_taxa()
 
     def _refresh_tags(self) -> None:
         while self._tags_flow.count():
@@ -428,6 +546,74 @@ class PaperDetail(QWidget):
             self._db.update_paper_field(self._paper.id, "tags", json.dumps(self._paper.tags))
             self._refresh_tags()
             self.paper_changed.emit(self._paper.id)
+
+    def _refresh_taxa(self) -> None:
+        while self._taxa_flow.count():
+            item = self._taxa_flow.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._taxa_lock_row.setVisible(bool(self._paper and self._paper.taxa_locked))
+        if not self._paper:
+            return
+
+        for name in self._paper.taxa:
+            chip = TagChip(name, self._taxa_container)
+            chip.setToolTip(f"Remove the taxon “{name}”")
+            chip.removed.connect(self._remove_taxon)
+            self._taxa_flow.addWidget(chip)
+
+    def _write_taxa(self, taxa: list[str], *, locked: bool) -> None:
+        """Persist the paper's taxa and lock flag together, then redraw and announce."""
+        assert self._paper is not None and self._paper.id is not None
+        self._paper.taxa = taxa
+        self._paper.taxa_locked = locked
+        self._db.update_paper_field(self._paper.id, "taxa", json.dumps(taxa))
+        self._db.update_paper_field(self._paper.id, "taxa_locked", int(locked))
+        self._refresh_taxa()
+        self.paper_changed.emit(self._paper.id)
+
+    def _add_taxon(self) -> None:
+        if not self._paper or self._paper.id is None:
+            return
+        name = self._taxa.canonical(self._taxon_input.text())
+        if name is None:
+            # Only names from taxa.txt: a free-typed taxon would sit outside the sidebar
+            # tree and could never be found again through it.
+            self._set_taxon_invalid(bool(self._taxon_input.text().strip()))
+            return
+        self._set_taxon_invalid(False)
+        self._taxon_input.clear()
+        if name not in self._paper.taxa:
+            self._write_taxa(sorted([*self._paper.taxa, name]), locked=True)
+
+    def _remove_taxon(self, name: str) -> None:
+        if not self._paper or self._paper.id is None or name not in self._paper.taxa:
+            return
+        self._write_taxa([t for t in self._paper.taxa if t != name], locked=True)
+
+    def _unlock_taxa(self) -> None:
+        if not self._paper or self._paper.id is None:
+            return
+        self._write_taxa(list(self._paper.taxa), locked=False)
+
+    def _set_taxon_invalid(self, invalid: bool) -> None:
+        if invalid:
+            self._taxon_error.setText(
+                f"“{self._taxon_input.text().strip()}” is not a taxon name in taxa.txt. "
+                "Typing a name's first letters lists the matches."
+            )
+        self._taxon_error.setVisible(invalid)
+        if self._taxon_input.property("invalid") == invalid:
+            return
+        self._taxon_input.setProperty("invalid", invalid)
+        self._taxon_input.style().unpolish(self._taxon_input)
+        self._taxon_input.style().polish(self._taxon_input)
+
+    def set_taxa(self, taxa: TaxonTree) -> None:
+        """Use `taxa` to validate and complete hand-added taxa."""
+        self._taxa = taxa
+        self._taxon_completer.setModel(QStringListModel(taxa.names, self._taxon_completer))
 
     def _dismiss_review(self) -> None:
         if not self._paper or self._paper.id is None:

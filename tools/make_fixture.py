@@ -148,7 +148,6 @@ def main() -> int:
         "category_threshold": 0.35,
         "tag_count": 5,
         "taxonomy_path": "",
-        "taxonomy_top_k": 4,
         "reduce_motion": False,
     }
     (out / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
