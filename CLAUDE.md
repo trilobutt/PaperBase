@@ -650,6 +650,14 @@ the state lines were never written, and on a redo the content-hash check classes
 duplicates. Unfixed; a bounded retry inside `Indexer.commit` is the obvious remedy and is its
 own piece of work.
 
+**PyQt6 breaks torch unless the C++ runtime is pinned first.** The PyQt6 wheel bundles
+MSVC 14.26 `msvcp140.dll` in `Qt6/bin`; once Qt loads it, torch's `c10.dll` binds to it
+and dies with `WinError 1114`. `paperbase/__init__.py` loads the System32 runtime before
+anything can import PyQt6, so every entry point must import through the `paperbase`
+package; `tests/test_smoke.py` checks the order in a fresh interpreter. `load_model`
+catches every exception, never only `ImportError`: one escaping `QThread.run` is a
+`qFatal` in PyQt6 and takes the application down.
+
 **fitz context manager:** `fitz.Document` supports `with fitz.open(str(path)) as doc:` (PyMuPDF >= 1.18; project requires >= 1.24). Prefer this over manual `.close()` — bare `.close()` inside a `try` without `finally` leaks on exception.
 
 **Windows file actions:**

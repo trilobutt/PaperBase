@@ -9,7 +9,8 @@ assign papers to matching collections in the DB. Tag extraction uses YAKE
 and neither needs a model at all.
 
 sentence-transformers is optional at import time; it is loaded lazily inside
-load_model(). If not installed the categoriser returns empty results silently.
+load_model(). If the model cannot be loaded, for any reason, the categoriser records why
+and carries on without it: collections wait, while keywords and taxa still run.
 """
 import logging
 import threading
@@ -72,10 +73,16 @@ class EmbeddingCategoriser:
         self._labels: list[Label] = []
         self._label_matrix: Optional[np.ndarray] = None
         self._taxa: TaxonTree = TaxonTree([])
+        self._load_error: Optional[str] = None
 
     @property
     def is_loaded(self) -> bool:
         return self._model is not None
+
+    @property
+    def load_error(self) -> Optional[str]:
+        """Why the last load_model() failed, or None if it has not failed."""
+        return self._load_error
 
     @property
     def has_categories(self) -> bool:
@@ -115,14 +122,24 @@ class EmbeddingCategoriser:
         with self._lock:
             if self._model is not None:
                 return
+            # Every exception, not only ImportError: torch failing its DLL initialisation
+            # raises OSError, and so does a model download that cannot reach the Hub. One
+            # escaping CategorizationWorker.run is an unhandled exception in a QThread,
+            # which PyQt6 turns into qFatal and takes the whole application down.
             try:
                 model = _load_sentence_transformer(self.MODEL_NAME)
-            except ImportError:
+            except ImportError as e:
+                self._load_error = f"sentence-transformers is not installed ({e})"
                 logger.error(
                     "sentence-transformers is required for auto-categorisation. "
                     "Run: pip install sentence-transformers"
                 )
                 return
+            except Exception as e:
+                self._load_error = f"{type(e).__name__}: {e}"
+                logger.exception("Embedding model %s failed to load", self.MODEL_NAME)
+                return
+            self._load_error = None
             self._model = model
             if self._categories:
                 self._recompute_embeddings()
@@ -388,8 +405,8 @@ class CategorizationWorker(QThread):
         self._categoriser.load_model()
         if not self._categoriser.is_loaded:
             self.log_message.emit(
-                "Model failed to load; collections cannot be assigned. Keyword and "
-                "taxon tagging need no model and will still run."
+                "Model failed to load, so collections cannot be assigned; keyword and taxon "
+                f"tagging need no model and will still run. Reason: {self._categoriser.load_error}"
             )
         self.log_message.emit(
             f"{len(self._categoriser.labels):,} topic labels and "

@@ -250,6 +250,35 @@ def test_worker_without_model_still_tags(monkeypatch, db, store_path) -> None:
         assert updated.tags, "expected keyword tags even without a model"
 
 
+def test_worker_survives_model_load_failure(monkeypatch, db, store_path) -> None:
+    """A load failure other than ImportError must end the run normally. It escaped
+    QThread.run as an OSError from torch's DLL initialisation, and PyQt6 aborted the
+    process."""
+    def _raise_os_error(name):
+        raise OSError("[WinError 1114] A dynamic link library (DLL) initialization failed")
+
+    monkeypatch.setattr(categoriser, "_load_sentence_transformer", _raise_os_error)
+
+    cat = EmbeddingCategoriser()
+    paper = make_paper(title="Paper", abstract=ABSTRACT_TEXT)
+    paper.id = db.insert_paper(paper)
+    store = VectorStore(store_path)
+    store.open()
+
+    worker = CategorizationWorker(db, cat, store)
+    messages: list[str] = []
+    finished: list[bool] = []
+    worker.log_message.connect(messages.append)
+    worker.finished_all.connect(lambda: finished.append(True))
+    worker.run()
+
+    assert finished == [True]
+    assert not cat.is_loaded
+    assert cat.load_error is not None and "WinError 1114" in cat.load_error
+    assert any("WinError 1114" in m for m in messages), "the reason must reach the dialog"
+    assert db.get_paper(paper.id).tags, "keyword tagging runs without the model"
+
+
 TAXA = parse_taxa(
     "Arthropoda: arthropods\n"
     "Arthropoda > Coleoptera: beetles\n"
